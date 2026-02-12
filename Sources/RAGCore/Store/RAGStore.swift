@@ -351,6 +351,30 @@ public actor RAGStore {
       throw RAGError.sqlite("Must provide repoId or repoPath")
     }
 
+    print("[RAG] deleteRepo: targetId=\(targetId)")
+
+    // Helper to execute a DELETE and check for errors
+    func execDelete(_ sql: String, label: String) throws {
+      var stmt: OpaquePointer?
+      let prepareResult = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+      guard prepareResult == SQLITE_OK, let stmt else {
+        let msg = String(cString: sqlite3_errmsg(db))
+        print("[RAG] deleteRepo: PREPARE failed for \(label): \(msg)")
+        throw RAGError.sqlite("deleteRepo \(label) prepare failed: \(msg)")
+      }
+      defer { sqlite3_finalize(stmt) }
+      sqlite3_bind_text(stmt, 1, targetId, -1, sqliteTransient)
+      let stepResult = sqlite3_step(stmt)
+      if stepResult != SQLITE_DONE {
+        let msg = String(cString: sqlite3_errmsg(db))
+        print("[RAG] deleteRepo: STEP failed for \(label): code=\(stepResult) msg=\(msg)")
+        throw RAGError.sqlite("deleteRepo \(label) failed: \(msg)")
+      }
+      let changes = sqlite3_changes(db)
+      print("[RAG] deleteRepo: \(label) removed \(changes) rows")
+    }
+
+    // Count files before deletion
     let countSql = "SELECT COUNT(*) FROM files WHERE repo_id = ?"
     var countStmt: OpaquePointer?
     sqlite3_prepare_v2(db, countSql, -1, &countStmt, nil)
@@ -360,52 +384,48 @@ public actor RAGStore {
     if sqlite3_step(countStmt) == SQLITE_ROW {
       deletedFiles = Int(sqlite3_column_int(countStmt, 0))
     }
+    print("[RAG] deleteRepo: repo has \(deletedFiles) files to delete")
 
+    // Delete from vec_chunks first (virtual table - CASCADE doesn't apply)
     if extensionLoaded {
-      let deleteVecSql = """
+      try execDelete("""
         DELETE FROM vec_chunks WHERE chunk_id IN (
-          SELECT c.id FROM chunks c JOIN files f ON c.file_id = f.id WHERE f.repo_id = ?
+          SELECT c.id FROM chunks c
+          JOIN files f ON c.file_id = f.id
+          WHERE f.repo_id = ?
         )
-        """
-      var vecStmt: OpaquePointer?
-      sqlite3_prepare_v2(db, deleteVecSql, -1, &vecStmt, nil)
-      defer { sqlite3_finalize(vecStmt) }
-      sqlite3_bind_text(vecStmt, 1, targetId, -1, sqliteTransient)
-      sqlite3_step(vecStmt)
+        """, label: "vec_chunks")
     }
 
-    let deleteEmbeddingsSql = """
+    // Delete dependencies by repo_id
+    try execDelete("DELETE FROM dependencies WHERE repo_id = ?", label: "dependencies")
+
+    // Delete symbol_refs by repo_id
+    try execDelete("DELETE FROM symbol_refs WHERE repo_id = ?", label: "symbol_refs")
+
+    // Delete embeddings
+    try execDelete("""
       DELETE FROM embeddings WHERE chunk_id IN (
-        SELECT c.id FROM chunks c JOIN files f ON c.file_id = f.id WHERE f.repo_id = ?
+        SELECT c.id FROM chunks c
+        JOIN files f ON c.file_id = f.id
+        WHERE f.repo_id = ?
       )
-      """
-    var embStmt: OpaquePointer?
-    sqlite3_prepare_v2(db, deleteEmbeddingsSql, -1, &embStmt, nil)
-    defer { sqlite3_finalize(embStmt) }
-    sqlite3_bind_text(embStmt, 1, targetId, -1, sqliteTransient)
-    sqlite3_step(embStmt)
+      """, label: "embeddings")
 
-    let deleteChunksSql = "DELETE FROM chunks WHERE file_id IN (SELECT id FROM files WHERE repo_id = ?)"
-    var chunkStmt: OpaquePointer?
-    sqlite3_prepare_v2(db, deleteChunksSql, -1, &chunkStmt, nil)
-    defer { sqlite3_finalize(chunkStmt) }
-    sqlite3_bind_text(chunkStmt, 1, targetId, -1, sqliteTransient)
-    sqlite3_step(chunkStmt)
+    // Delete chunks
+    try execDelete("""
+      DELETE FROM chunks WHERE file_id IN (
+        SELECT id FROM files WHERE repo_id = ?
+      )
+      """, label: "chunks")
 
-    let deleteFilesSql = "DELETE FROM files WHERE repo_id = ?"
-    var fileStmt: OpaquePointer?
-    sqlite3_prepare_v2(db, deleteFilesSql, -1, &fileStmt, nil)
-    defer { sqlite3_finalize(fileStmt) }
-    sqlite3_bind_text(fileStmt, 1, targetId, -1, sqliteTransient)
-    sqlite3_step(fileStmt)
+    // Delete files
+    try execDelete("DELETE FROM files WHERE repo_id = ?", label: "files")
 
-    let deleteRepoSql = "DELETE FROM repos WHERE id = ?"
-    var repoStmt: OpaquePointer?
-    sqlite3_prepare_v2(db, deleteRepoSql, -1, &repoStmt, nil)
-    defer { sqlite3_finalize(repoStmt) }
-    sqlite3_bind_text(repoStmt, 1, targetId, -1, sqliteTransient)
-    sqlite3_step(repoStmt)
+    // Delete repo
+    try execDelete("DELETE FROM repos WHERE id = ?", label: "repo")
 
+    print("[RAG] deleteRepo: completed, \(deletedFiles) files removed")
     return deletedFiles
   }
 

@@ -37,12 +37,15 @@ extension RAGStore {
 
     let repoURL = URL(fileURLWithPath: path)
     let workspaceRepos = detectWorkspaceRepos(rootURL: repoURL)
-    let subPackages = detectSubPackages(rootURL: repoURL, excludingGitRepos: workspaceRepos)
-    let allSubPaths = workspaceRepos + subPackages
 
-    // Workspace auto-indexing: if sub-repos or sub-packages are found,
-    // auto-index each one as a separate repo entry with parent_repo_id
-    if allSubPaths.count >= 2 && !allowWorkspace {
+    // Workspace auto-indexing: only split into sub-indexes when multiple
+    // separate git repos are detected (e.g., a workspace folder containing
+    // several cloned repos). Sub-packages within a single repo (nested
+    // package.json, Package.swift, etc.) should NOT cause splitting — those
+    // are part of the same codebase and belong in one index.
+    if workspaceRepos.count >= 2 && !allowWorkspace {
+      let subPackages = detectSubPackages(rootURL: repoURL, excludingGitRepos: workspaceRepos)
+      let allSubPaths = workspaceRepos + subPackages
       let parentRepoId = VectorMath.stableId(for: path)
       let parentName = repoURL.lastPathComponent
       let now = dateFormatter.string(from: Date())
@@ -51,7 +54,7 @@ extension RAGStore {
       try upsertRepo(id: parentRepoId, name: parentName, rootPath: path, lastIndexedAt: now, repoIdentifier: parentIdentifier, parentRepoId: nil)
 
       var subReports: [RAGIndexReport] = []
-      var totalFiles = 0, totalSkipped = 0, totalChunks = 0
+      var totalFiles = 0, totalSkipped = 0, totalRemoved = 0, totalChunks = 0
       var totalBytes = 0, totalEmbeddings = 0, totalEmbeddingMs = 0
       var totalAST = 0, totalLine = 0, totalFailures = 0
 
@@ -76,6 +79,7 @@ extension RAGStore {
         subReports.append(subReport)
         totalFiles += subReport.filesIndexed
         totalSkipped += subReport.filesSkipped
+        totalRemoved += subReport.filesRemoved
         totalChunks += subReport.chunksIndexed
         totalBytes += subReport.bytesScanned
         totalEmbeddings += subReport.embeddingCount
@@ -91,6 +95,7 @@ extension RAGStore {
         repoPath: path,
         filesIndexed: totalFiles,
         filesSkipped: totalSkipped,
+        filesRemoved: totalRemoved,
         chunksIndexed: totalChunks,
         bytesScanned: totalBytes,
         durationMs: durationMs,
@@ -138,8 +143,15 @@ extension RAGStore {
     let embeddingBatchSize = 4
     let memoryCheckInterval = 10
 
+    // Throttle progress callbacks to avoid flooding the main thread
+    // For large repos (2000+ files), per-file callbacks can lock up the UI
+    let progressInterval = max(1, scannedFiles.count / 100)  // ~100 updates total
+    var lastEmbeddingProgressTime = Date.distantPast
+
     for (fileIndex, candidate) in scannedFiles.enumerated() {
-      progress?(.analyzing(current: fileIndex + 1, total: scannedFiles.count, fileName: URL(fileURLWithPath: candidate.path).lastPathComponent))
+      if fileIndex % progressInterval == 0 {
+        progress?(.analyzing(current: fileIndex + 1, total: scannedFiles.count, fileName: URL(fileURLWithPath: candidate.path).lastPathComponent))
+      }
 
       // Memory pressure check
       if fileIndex % memoryCheckInterval == 0 {
@@ -210,7 +222,6 @@ extension RAGStore {
       }
 
       if !missingEmbeddings.isEmpty {
-        progress?(.embedding(current: 0, total: missingEmbeddings.count))
         let embedStart = Date()
 
         for batchStart in stride(from: 0, to: missingEmbeddings.count, by: embeddingBatchSize) {
@@ -228,7 +239,12 @@ extension RAGStore {
             }
           }
 
-          progress?(.embedding(current: batchEnd, total: missingEmbeddings.count))
+          // Throttle embedding progress — at most once per second
+          let now = Date()
+          if now.timeIntervalSince(lastEmbeddingProgressTime) >= 1.0 {
+            lastEmbeddingProgressTime = now
+            progress?(.embedding(current: batchEnd, total: missingEmbeddings.count))
+          }
 
           // Clear caches after each batch to prevent memory accumulation
           if let batchAware = embeddingProvider as? BatchAwareEmbeddingProvider {
@@ -242,7 +258,9 @@ extension RAGStore {
         embeddingCache.removeAll(keepingCapacity: false)
       }
 
-      progress?(.storing(current: filesIndexed + 1, total: scannedFiles.count))
+      if filesIndexed % progressInterval == 0 {
+        progress?(.storing(current: filesIndexed + 1, total: scannedFiles.count))
+      }
 
       let modulePath = extractModulePath(from: relativePath)
       let featureTags = extractFeatureTags(from: relativePath, language: file.language, chunks: chunks)
@@ -313,12 +331,25 @@ extension RAGStore {
     logMemory("index complete")
     print("[RAG] AST stats: \(astFilesChunked) AST, \(lineFilesChunked) line-based, \(chunkingFailures) failures")
 
+    // Prune files from the index that no longer exist on disk
+    let currentPaths = Set(scannedFiles.map { file -> String in
+      let filePath = file.path
+      return filePath.hasPrefix(path + "/")
+        ? String(filePath.dropFirst(path.count + 1))
+        : filePath
+    })
+    let filesRemovedCount = try pruneDeletedFiles(repoId: repoId, currentPaths: currentPaths)
+    if filesRemovedCount > 0 {
+      print("[RAG] Pruned \(filesRemovedCount) deleted files from index")
+    }
+
     let durationMs = Int(Date().timeIntervalSince(startTime) * 1000)
     let report = RAGIndexReport(
       repoId: repoId,
       repoPath: path,
       filesIndexed: filesIndexed,
       filesSkipped: skippedUnchanged,
+      filesRemoved: filesRemovedCount,
       chunksIndexed: chunkCount,
       bytesScanned: bytesScanned,
       durationMs: durationMs,
@@ -330,5 +361,60 @@ extension RAGStore {
     )
     progress?(.complete(report: report))
     return report
+  }
+
+  // MARK: - Stale File Pruning
+
+  /// Remove files from the index that no longer exist on disk.
+  /// Cascades to chunks → embeddings via FK constraints; vec_chunks
+  /// must be cleaned explicitly since virtual tables don't support CASCADE.
+  internal func pruneDeletedFiles(repoId: String, currentPaths: Set<String>) throws -> Int {
+    guard let db else {
+      throw RAGError.sqlite("Database not initialized")
+    }
+
+    // Fetch all indexed paths for this repo
+    let sql = "SELECT id, path FROM files WHERE repo_id = ?"
+    var statement: OpaquePointer?
+    let result = sqlite3_prepare_v2(db, sql, -1, &statement, nil)
+    guard result == SQLITE_OK, let statement else {
+      let message = String(cString: sqlite3_errmsg(db))
+      throw RAGError.sqlite(message)
+    }
+    defer { sqlite3_finalize(statement) }
+    bindText(statement, 1, repoId)
+
+    var staleFiles: [(id: String, path: String)] = []
+    while sqlite3_step(statement) == SQLITE_ROW {
+      guard let idPtr = sqlite3_column_text(statement, 0),
+            let pathPtr = sqlite3_column_text(statement, 1) else { continue }
+      let fileId = String(cString: idPtr)
+      let filePath = String(cString: pathPtr)
+      if !currentPaths.contains(filePath) {
+        staleFiles.append((id: fileId, path: filePath))
+      }
+    }
+
+    guard !staleFiles.isEmpty else { return 0 }
+
+    for staleFile in staleFiles {
+      // vec_chunks first (virtual table — no CASCADE)
+      if extensionLoaded {
+        let vecSql = "DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = ?)"
+        try execute(sql: vecSql) { stmt in
+          bindText(stmt, 1, staleFile.id)
+        }
+      }
+      // Delete dependencies and symbol refs
+      try deleteDependencies(for: staleFile.id)
+      try deleteSymbolRefs(for: staleFile.id)
+      // Delete the file row — chunks and embeddings cascade
+      let delSql = "DELETE FROM files WHERE id = ?"
+      try execute(sql: delSql) { stmt in
+        bindText(stmt, 1, staleFile.id)
+      }
+    }
+
+    return staleFiles.count
   }
 }

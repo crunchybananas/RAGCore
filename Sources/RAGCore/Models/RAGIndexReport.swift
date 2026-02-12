@@ -13,6 +13,7 @@ public struct RAGIndexReport: Sendable {
   public let repoPath: String
   public let filesIndexed: Int
   public let filesSkipped: Int
+  public let filesRemoved: Int
   public let chunksIndexed: Int
   public let bytesScanned: Int
   public let durationMs: Int
@@ -29,7 +30,8 @@ public struct RAGIndexReport: Sendable {
 
   public init(
     repoId: String, repoPath: String,
-    filesIndexed: Int, filesSkipped: Int, chunksIndexed: Int, bytesScanned: Int,
+    filesIndexed: Int, filesSkipped: Int, filesRemoved: Int = 0,
+    chunksIndexed: Int, bytesScanned: Int,
     durationMs: Int, embeddingCount: Int, embeddingDurationMs: Int,
     astFilesChunked: Int, lineFilesChunked: Int, chunkingFailures: Int,
     subReports: [RAGIndexReport] = []
@@ -38,6 +40,7 @@ public struct RAGIndexReport: Sendable {
     self.repoPath = repoPath
     self.filesIndexed = filesIndexed
     self.filesSkipped = filesSkipped
+    self.filesRemoved = filesRemoved
     self.chunksIndexed = chunksIndexed
     self.bytesScanned = bytesScanned
     self.durationMs = durationMs
