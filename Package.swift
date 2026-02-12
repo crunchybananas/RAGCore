@@ -15,15 +15,15 @@ let package = Package(
     ),
   ],
   dependencies: [
-    .package(path: "../MCPCore"),
-    .package(path: "../ASTChunker"),
+    .package(url: "https://github.com/crunchybananas/MCPCore.git", from: "1.0.0"),
+    .package(url: "https://github.com/crunchybananas/ast-chunker.git", from: "1.0.0"),
   ],
   targets: [
     .target(
       name: "RAGCore",
       dependencies: [
         .product(name: "CSQLite", package: "MCPCore"),
-        .product(name: "ASTChunker", package: "ASTChunker"),
+        .product(name: "ASTChunker", package: "ast-chunker"),
       ]
     ),
     .testTarget(
