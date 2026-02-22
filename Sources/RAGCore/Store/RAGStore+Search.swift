@@ -111,14 +111,46 @@ extension RAGStore {
       throw RAGError.embeddingFailed("Failed to generate query embedding")
     }
 
+    return try searchVectorWithEmbedding(
+      queryVector, repoPath: repoPath,
+      limit: limit, threshold: threshold, modulePath: modulePath
+    )
+  }
+
+  /// Search using a pre-computed query embedding vector.
+  ///
+  /// Use this when the caller has already generated the query embedding
+  /// (e.g. using a different model than the store's default provider to
+  /// match the stored embedding dimensions for a synced repo).
+  ///
+  /// - Parameters:
+  ///   - queryEmbedding: Pre-computed embedding vector for the query.
+  ///   - repoPath: Optional repo path to scope the search.
+  ///   - limit: Maximum number of results.
+  ///   - threshold: Minimum similarity score (0.0-1.0).
+  ///   - modulePath: Optional module path filter.
+  /// - Returns: Search results ordered by relevance.
+  public func searchVectorWithEmbedding(
+    _ queryEmbedding: [Float],
+    repoPath: String? = nil,
+    limit: Int = 10,
+    threshold: Float = 0.3,
+    modulePath: String? = nil
+  ) throws -> [RAGSearchResult] {
+    try openIfNeeded()
+    try ensureSchema()
+    guard !queryEmbedding.isEmpty else {
+      throw RAGError.embeddingFailed("Empty query embedding vector")
+    }
+
     if extensionLoaded {
       return try searchVectorAccelerated(
-        queryVector: queryVector, repoPath: repoPath,
+        queryVector: queryEmbedding, repoPath: repoPath,
         limit: limit, threshold: threshold, modulePath: modulePath
       )
     } else {
       return try searchVectorBruteForce(
-        queryVector: queryVector, repoPath: repoPath,
+        queryVector: queryEmbedding, repoPath: repoPath,
         limit: limit, threshold: threshold, modulePath: modulePath
       )
     }
