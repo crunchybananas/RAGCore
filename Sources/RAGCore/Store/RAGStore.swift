@@ -164,6 +164,9 @@ public actor RAGStore {
 
   internal let dateFormatter = ISO8601DateFormatter()
 
+  /// Cache for git remote URL lookups to avoid repeated subprocess calls.
+  internal var remoteURLCache: [String: String?] = [:]
+
   /// Package manifest filenames for sub-package detection.
   static let packageManifests: Set<String> = [
     "Package.swift",
@@ -346,7 +349,7 @@ public actor RAGStore {
     if let repoId {
       targetId = repoId
     } else if let repoPath {
-      targetId = VectorMath.stableId(for: repoPath)
+      targetId = try resolveRepoId(for: repoPath)
     } else {
       throw RAGError.sqlite("Must provide repoId or repoPath")
     }
@@ -678,12 +681,100 @@ public actor RAGStore {
     }
   }
 
+  // MARK: - Repo Identity Resolution
+
+  /// Resolved repo record containing the database ID and current root path.
+  public struct ResolvedRepo: Sendable {
+    public let id: String
+    public let rootPath: String
+  }
+
+  /// Resolve a filesystem path to a repo record in the database.
+  ///
+  /// Resolution order:
+  /// 1. Check if `root_path` matches directly (fast path for local repos).
+  /// 2. Discover the git remote URL for the given path, normalize it.
+  /// 3. Match by `repo_identifier` (normalized git remote URL).
+  /// 4. If found via identifier and `root_path` differs, auto-update `root_path`.
+  ///
+  /// - Parameter repoPath: Absolute filesystem path to the repository.
+  /// - Returns: The resolved repo record, or nil if no matching repo found.
+  public func resolveRepo(for repoPath: String) throws -> ResolvedRepo? {
+    try openIfNeeded()
+    guard let db else { return nil }
+
+    // 1. Try exact root_path match
+    let directSql = "SELECT id, root_path FROM repos WHERE root_path = ? LIMIT 1"
+    var stmt: OpaquePointer?
+    if sqlite3_prepare_v2(db, directSql, -1, &stmt, nil) == SQLITE_OK, let s = stmt {
+      defer { sqlite3_finalize(s) }
+      bindText(s, 1, repoPath)
+      if sqlite3_step(s) == SQLITE_ROW {
+        let id = String(cString: sqlite3_column_text(s, 0))
+        let rootPath = String(cString: sqlite3_column_text(s, 1))
+        return ResolvedRepo(id: id, rootPath: rootPath)
+      }
+    }
+
+    // 2. Discover git remote URL for this path
+    let normalizedURL: String?
+    if let cached = remoteURLCache[repoPath] {
+      normalizedURL = cached
+    } else {
+      normalizedURL = Self.discoverNormalizedRemoteURL(for: repoPath)
+      remoteURLCache[repoPath] = normalizedURL
+    }
+
+    guard let identifier = normalizedURL else { return nil }
+
+    // 3. Match by repo_identifier
+    let identSql = "SELECT id, root_path FROM repos WHERE repo_identifier = ? LIMIT 1"
+    stmt = nil
+    if sqlite3_prepare_v2(db, identSql, -1, &stmt, nil) == SQLITE_OK, let s = stmt {
+      defer { sqlite3_finalize(s) }
+      bindText(s, 1, identifier)
+      if sqlite3_step(s) == SQLITE_ROW {
+        let repoId = String(cString: sqlite3_column_text(s, 0))
+        let storedPath = String(cString: sqlite3_column_text(s, 1))
+
+        // 4. Auto-update root_path if it differs (repo moved or synced from another machine)
+        if storedPath != repoPath {
+          let escapedPath = repoPath.replacingOccurrences(of: "'", with: "''")
+          try? exec("UPDATE repos SET root_path = '\(escapedPath)' WHERE id = '\(repoId)'")
+          print("[RAG] Auto-remapped repo \(identifier): \(storedPath) → \(repoPath)")
+        }
+        return ResolvedRepo(id: repoId, rootPath: repoPath)
+      }
+    }
+
+    return nil
+  }
+
+  /// Resolve a filesystem path to a repo ID.
+  ///
+  /// Uses `resolveRepo(for:)` to find an existing repo. If not found, falls back
+  /// to the legacy behavior of deriving the ID from `stableId(for: path)`.
+  ///
+  /// - Parameter repoPath: Absolute filesystem path to the repository.
+  /// - Returns: The repo ID (either resolved from DB or derived from path).
+  public func resolveRepoId(for repoPath: String) throws -> String {
+    if let resolved = try resolveRepo(for: repoPath) {
+      return resolved.id
+    }
+    return VectorMath.stableId(for: repoPath)
+  }
+
   // MARK: - Repo Path Remapping
 
   /// Remap a repository's stored path and ID across all tables.
   ///
   /// Used when importing artifact bundles from machines with different directory layouts.
   /// Updates the repo ID (SHA-256 of path) and root_path in all related tables.
+  ///
+  /// - Note: **Deprecated.** The `resolveRepo(for:)` method now transparently resolves
+  ///   repos via `repo_identifier` (normalized git remote URL) and auto-updates `root_path`
+  ///   on mismatch. Manual remapping should no longer be necessary.
+  @available(*, deprecated, message: "Use resolveRepo(for:) instead — repos are now resolved by repo_identifier automatically.")
   public func remapRepoPath(oldId: String, newPath: String) throws {
     try openIfNeeded()
     try ensureSchema()

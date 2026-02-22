@@ -72,21 +72,9 @@ extension RAGStore {
     try openIfNeeded()
     guard let db else { throw RAGError.sqlite("Database not initialized") }
 
-    // Get the repo ID
-    let repoIdSql = "SELECT id FROM repos WHERE root_path = ?"
-    var statement: OpaquePointer?
-    var result = sqlite3_prepare_v2(db, repoIdSql, -1, &statement, nil)
-    guard result == SQLITE_OK, let stmt = statement else {
-      throw RAGError.sqlite("Failed to prepare repo query")
-    }
-    bindText(stmt, 1, repoPath)
-    var repoId: String?
-    if sqlite3_step(stmt) == SQLITE_ROW, let text = sqlite3_column_text(stmt, 0) {
-      repoId = String(cString: text)
-    }
-    sqlite3_finalize(stmt)
-
-    guard let repoId else { return [] }
+    // Resolve the repo ID via repo_identifier (cross-machine safe)
+    guard let resolved = try resolveRepo(for: repoPath) else { return [] }
+    let repoId = resolved.id
 
     // Build exclusion patterns
     var excludePatterns: [String] = []
@@ -131,7 +119,8 @@ extension RAGStore {
     }
     sql += "\n  ORDER BY f.line_count DESC LIMIT \(limit)"
 
-    result = sqlite3_prepare_v2(db, sql, -1, &statement, nil)
+    var statement: OpaquePointer?
+    let result = sqlite3_prepare_v2(db, sql, -1, &statement, nil)
     guard result == SQLITE_OK, let stmt2 = statement else {
       let errMsg = String(cString: sqlite3_errmsg(db))
       throw RAGError.sqlite("Failed to prepare orphan query: \(errMsg)")
@@ -181,8 +170,9 @@ extension RAGStore {
     try openIfNeeded()
     guard let db else { throw RAGError.sqlite("Database not initialized") }
 
-    var conditions = ["repos.root_path = ?"]
-    var params: [Any] = [repoPath]
+    let resolvedRepoId = try resolveRepoId(for: repoPath)
+    var conditions = ["repos.id = ?"]
+    var params: [Any] = [resolvedRepoId]
 
     if let minLines { conditions.append("files.line_count >= ?"); params.append(minLines) }
     if let maxLines { conditions.append("files.line_count <= ?"); params.append(maxLines) }
@@ -248,19 +238,21 @@ extension RAGStore {
     try openIfNeeded()
     guard let db else { throw RAGError.sqlite("Database not initialized") }
 
+    let resolvedRepoId = try resolveRepoId(for: repoPath)
+
     let statsSql = """
       SELECT COUNT(*) as file_count,
              COALESCE(SUM(line_count), 0) as total_lines,
              COALESCE(SUM(method_count), 0) as total_methods
       FROM files JOIN repos ON repos.id = files.repo_id
-      WHERE repos.root_path = ?
+      WHERE repos.id = ?
       """
     var statement: OpaquePointer?
     var result = sqlite3_prepare_v2(db, statsSql, -1, &statement, nil)
     guard result == SQLITE_OK, let stmt = statement else {
       throw RAGError.sqlite("Failed to prepare stats query")
     }
-    bindText(stmt, 1, repoPath)
+    bindText(stmt, 1, resolvedRepoId)
 
     var totalFiles = 0, totalLines = 0, totalMethods = 0
     if sqlite3_step(stmt) == SQLITE_ROW {
@@ -274,13 +266,13 @@ extension RAGStore {
     let largestSql = """
       SELECT files.path, COALESCE(files.line_count, 0) as lines
       FROM files JOIN repos ON repos.id = files.repo_id
-      WHERE repos.root_path = ?
+      WHERE repos.id = ?
       ORDER BY lines DESC LIMIT 1
       """
     result = sqlite3_prepare_v2(db, largestSql, -1, &statement, nil)
     var largestFile: (path: String, lines: Int)?
     if result == SQLITE_OK, let stmt2 = statement {
-      bindText(stmt2, 1, repoPath)
+      bindText(stmt2, 1, resolvedRepoId)
       if sqlite3_step(stmt2) == SQLITE_ROW {
         let path = sqlite3_column_text(stmt2, 0).map { String(cString: $0) } ?? ""
         let lines = Int(sqlite3_column_int(stmt2, 1))
@@ -293,13 +285,13 @@ extension RAGStore {
     let mostMethodsSql = """
       SELECT files.path, COALESCE(files.method_count, 0) as methods
       FROM files JOIN repos ON repos.id = files.repo_id
-      WHERE repos.root_path = ?
+      WHERE repos.id = ?
       ORDER BY methods DESC LIMIT 1
       """
     result = sqlite3_prepare_v2(db, mostMethodsSql, -1, &statement, nil)
     var mostMethods: (path: String, count: Int)?
     if result == SQLITE_OK, let stmt3 = statement {
-      bindText(stmt3, 1, repoPath)
+      bindText(stmt3, 1, resolvedRepoId)
       if sqlite3_step(stmt3) == SQLITE_ROW {
         let path = sqlite3_column_text(stmt3, 0).map { String(cString: $0) } ?? ""
         let count = Int(sqlite3_column_int(stmt3, 1))
@@ -339,14 +331,16 @@ extension RAGStore {
       throw RAGError.embeddingFailed("Failed to generate embedding for query")
     }
 
+    let resolvedRepoId: String? = if let repoPath { try resolveRepo(for: repoPath)?.id } else { nil }
+
     if extensionLoaded {
       return try findSimilarCodeAccelerated(
-        queryVector: queryEmbedding, repoPath: repoPath,
+        queryVector: queryEmbedding, resolvedRepoId: resolvedRepoId,
         threshold: threshold, limit: limit, excludePath: excludePath
       )
     } else {
       return try findSimilarCodeBruteForce(
-        queryVector: queryEmbedding, repoPath: repoPath,
+        queryVector: queryEmbedding, resolvedRepoId: resolvedRepoId,
         threshold: threshold, limit: limit, excludePath: excludePath
       )
     }
@@ -355,7 +349,7 @@ extension RAGStore {
   /// Accelerated similar code search using sqlite-vec.
   private func findSimilarCodeAccelerated(
     queryVector: [Float],
-    repoPath: String?,
+    resolvedRepoId: String?,
     threshold: Double,
     limit: Int,
     excludePath: String?
@@ -371,7 +365,7 @@ extension RAGStore {
       JOIN chunks c ON c.id = v.chunk_id
       JOIN files f ON f.id = c.file_id
       JOIN repos r ON r.id = f.repo_id
-      WHERE (\(repoPath == nil ? "1=1" : "r.root_path = ?"))
+      WHERE (\(resolvedRepoId == nil ? "1=1" : "r.id = ?"))
         \(excludePath != nil ? "AND f.path != ?" : "")
       ORDER BY distance ASC
       LIMIT ?
@@ -390,7 +384,7 @@ extension RAGStore {
     }
 
     var paramIndex: Int32 = 2
-    if let repoPath { bindText(stmt, paramIndex, repoPath); paramIndex += 1 }
+    if let resolvedRepoId { bindText(stmt, paramIndex, resolvedRepoId); paramIndex += 1 }
     if let excludePath { bindText(stmt, paramIndex, excludePath); paramIndex += 1 }
     sqlite3_bind_int(stmt, paramIndex, Int32(limit * 2))
 
@@ -418,7 +412,7 @@ extension RAGStore {
   /// Brute-force similar code search using cosine similarity.
   private func findSimilarCodeBruteForce(
     queryVector: [Float],
-    repoPath: String?,
+    resolvedRepoId: String?,
     threshold: Double,
     limit: Int,
     excludePath: String?
@@ -434,7 +428,7 @@ extension RAGStore {
       JOIN repos r ON r.id = f.repo_id
       WHERE 1=1
       """
-    if repoPath != nil { sql += " AND r.root_path = ?" }
+    if resolvedRepoId != nil { sql += " AND r.id = ?" }
     if excludePath != nil { sql += " AND f.path != ?" }
 
     var statement: OpaquePointer?
@@ -446,7 +440,7 @@ extension RAGStore {
     defer { sqlite3_finalize(stmt) }
 
     var paramIndex: Int32 = 1
-    if let repoPath { bindText(stmt, paramIndex, repoPath); paramIndex += 1 }
+    if let resolvedRepoId { bindText(stmt, paramIndex, resolvedRepoId); paramIndex += 1 }
     if let excludePath { bindText(stmt, paramIndex, excludePath) }
 
     var candidates: [(path: String, startLine: Int, endLine: Int, snippet: String, similarity: Double, constructType: String?, constructName: String?)] = []

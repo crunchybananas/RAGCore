@@ -32,6 +32,15 @@ extension RAGStore {
     guard !trimmedQuery.isEmpty else { return [] }
     try openIfNeeded()
 
+    // Resolve repo identity (path-independent)
+    let resolvedRepoId: String?
+    if let repoPath {
+      resolvedRepoId = try resolveRepo(for: repoPath)?.id
+      guard resolvedRepoId != nil else { return [] }
+    } else {
+      resolvedRepoId = nil
+    }
+
     let words = trimmedQuery
       .components(separatedBy: .whitespacesAndNewlines)
       .filter { !$0.isEmpty }
@@ -58,8 +67,8 @@ extension RAGStore {
     }
 
     let sql: String
-    if repoPath != nil {
-      sql = sqlBase + " AND repos.root_path = ? ORDER BY files.path LIMIT ?"
+    if resolvedRepoId != nil {
+      sql = sqlBase + " AND repos.id = ? ORDER BY files.path LIMIT ?"
     } else {
       sql = sqlBase + " ORDER BY files.path LIMIT ?"
     }
@@ -77,8 +86,8 @@ extension RAGStore {
         bindText(statement, bindIndex, "%\(modulePath.lowercased())%")
         bindIndex += 1
       }
-      if let repoPath {
-        bindText(statement, bindIndex, repoPath)
+      if let resolvedRepoId {
+        bindText(statement, bindIndex, resolvedRepoId)
         bindIndex += 1
       }
       sqlite3_bind_int(statement, bindIndex, Int32(max(1, limit)))
@@ -106,13 +115,22 @@ extension RAGStore {
     try openIfNeeded()
     try ensureSchema()
 
+    // Resolve repo identity before searching
+    let resolvedRepoId: String?
+    if let repoPath {
+      resolvedRepoId = try resolveRepo(for: repoPath)?.id
+      guard resolvedRepoId != nil else { return [] }
+    } else {
+      resolvedRepoId = nil
+    }
+
     let embeddings = try await embeddingProvider.embed(texts: [query])
     guard let queryVector = embeddings.first, !queryVector.isEmpty else {
       throw RAGError.embeddingFailed("Failed to generate query embedding")
     }
 
     return try searchVectorWithEmbedding(
-      queryVector, repoPath: repoPath,
+      queryVector, resolvedRepoId: resolvedRepoId,
       limit: limit, threshold: threshold, modulePath: modulePath
     )
   }
@@ -143,14 +161,37 @@ extension RAGStore {
       throw RAGError.embeddingFailed("Empty query embedding vector")
     }
 
+    // Resolve repo identity
+    let resolvedRepoId: String?
+    if let repoPath {
+      resolvedRepoId = try resolveRepo(for: repoPath)?.id
+      guard resolvedRepoId != nil else { return [] }
+    } else {
+      resolvedRepoId = nil
+    }
+
+    return try searchVectorWithEmbedding(
+      queryEmbedding, resolvedRepoId: resolvedRepoId,
+      limit: limit, threshold: threshold, modulePath: modulePath
+    )
+  }
+
+  /// Internal: search with pre-resolved repo ID.
+  internal func searchVectorWithEmbedding(
+    _ queryEmbedding: [Float],
+    resolvedRepoId: String?,
+    limit: Int = 10,
+    threshold: Float = 0.3,
+    modulePath: String? = nil
+  ) throws -> [RAGSearchResult] {
     if extensionLoaded {
       return try searchVectorAccelerated(
-        queryVector: queryEmbedding, repoPath: repoPath,
+        queryVector: queryEmbedding, resolvedRepoId: resolvedRepoId,
         limit: limit, threshold: threshold, modulePath: modulePath
       )
     } else {
       return try searchVectorBruteForce(
-        queryVector: queryEmbedding, repoPath: repoPath,
+        queryVector: queryEmbedding, resolvedRepoId: resolvedRepoId,
         limit: limit, threshold: threshold, modulePath: modulePath
       )
     }
@@ -159,7 +200,7 @@ extension RAGStore {
   /// Accelerated vector search using sqlite-vec extension.
   internal func searchVectorAccelerated(
     queryVector: [Float],
-    repoPath: String?,
+    resolvedRepoId: String?,
     limit: Int,
     threshold: Float,
     modulePath: String?
@@ -182,7 +223,7 @@ extension RAGStore {
       WHERE 1=1
       """
 
-    if repoPath != nil { sql += " AND repos.root_path = ?" }
+    if resolvedRepoId != nil { sql += " AND repos.id = ?" }
     if modulePath != nil { sql += " AND LOWER(files.module_path) LIKE ?" }
     sql += " ORDER BY distance ASC LIMIT ?"
 
@@ -199,7 +240,7 @@ extension RAGStore {
     }
 
     var bindIdx: Int32 = 2
-    if let repoPath { bindText(stmt, bindIdx, repoPath); bindIdx += 1 }
+    if let resolvedRepoId { bindText(stmt, bindIdx, resolvedRepoId); bindIdx += 1 }
     if let modulePath { bindText(stmt, bindIdx, "%\(modulePath.lowercased())%"); bindIdx += 1 }
     sqlite3_bind_int(stmt, bindIdx, Int32(limit * 2))
 
@@ -246,7 +287,7 @@ extension RAGStore {
   /// Brute-force vector search using cosine similarity.
   internal func searchVectorBruteForce(
     queryVector: [Float],
-    repoPath: String?,
+    resolvedRepoId: String?,
     limit: Int,
     threshold: Float,
     modulePath: String?
@@ -265,12 +306,12 @@ extension RAGStore {
       WHERE 1=1
       """
 
-    if repoPath != nil { sql += " AND repos.root_path = ?" }
+    if resolvedRepoId != nil { sql += " AND repos.id = ?" }
     if modulePath != nil { sql += " AND LOWER(files.module_path) LIKE ?" }
 
     let rows = try queryEmbeddingRows(sql: sql) { stmt in
       var idx: Int32 = 1
-      if let repoPath { bindText(stmt, idx, repoPath); idx += 1 }
+      if let resolvedRepoId { bindText(stmt, idx, resolvedRepoId); idx += 1 }
       if let modulePath { bindText(stmt, idx, "%\(modulePath.lowercased())%") }
     }
 

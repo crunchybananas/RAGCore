@@ -24,7 +24,7 @@ extension RAGStore {
     try openIfNeeded()
     try ensureSchema()
 
-    let repoId = VectorMath.stableId(for: repoPath)
+    let repoId = try resolveRepoId(for: repoPath)
     let lessonId = VectorMath.stableId(for: "\(repoId):\(fixDescription):\(Date().timeIntervalSince1970)")
     let now = dateFormatter.string(from: Date())
 
@@ -62,7 +62,7 @@ extension RAGStore {
     try openIfNeeded()
     try ensureSchema()
 
-    let repoId = VectorMath.stableId(for: repoPath)
+    let repoId = try resolveRepoId(for: repoPath)
 
     var sql = """
       SELECT id, repo_id, error_signature, file_pattern, fix_description, fix_code,
@@ -104,7 +104,7 @@ extension RAGStore {
     try openIfNeeded()
     try ensureSchema()
 
-    let repoId = VectorMath.stableId(for: repoPath)
+    let repoId = try resolveRepoId(for: repoPath)
 
     var sql = """
       SELECT id, repo_id, error_signature, file_pattern, fix_description, fix_code,

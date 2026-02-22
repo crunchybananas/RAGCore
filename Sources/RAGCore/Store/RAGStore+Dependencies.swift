@@ -273,17 +273,18 @@ extension RAGStore {
   /// Get forward dependencies for a file.
   public func getDependencies(for filePath: String, inRepo repoPath: String) throws -> [RAGDependencyResult] {
     try openIfNeeded()
+    let resolvedRepoId = try resolveRepoId(for: repoPath)
     let sql = """
       SELECT f.path, d.target_path, tf.path, d.dependency_type, d.raw_import
       FROM dependencies d
       JOIN files f ON f.id = d.source_file_id
       JOIN repos r ON r.id = d.repo_id
       LEFT JOIN files tf ON tf.id = d.target_file_id
-      WHERE r.root_path = ? AND (f.path = ? OR f.path LIKE ?)
+      WHERE r.id = ? AND (f.path = ? OR f.path LIKE ?)
       ORDER BY d.dependency_type, d.target_path
       """
     return try queryDeps(sql: sql) { stmt in
-      bindText(stmt, 1, repoPath)
+      bindText(stmt, 1, resolvedRepoId)
       bindText(stmt, 2, filePath)
       bindText(stmt, 3, "%/\(filePath)")
     }
@@ -293,15 +294,16 @@ extension RAGStore {
   public func getDependents(for filePath: String, inRepo repoPath: String) throws -> [RAGDependencyResult] {
     try openIfNeeded()
     guard let db else { throw RAGError.sqlite("Database not initialized") }
+    let resolvedRepoId = try resolveRepoId(for: repoPath)
 
     // Find target file ID
-    let fidSql = "SELECT f.id FROM files f JOIN repos r ON r.id = f.repo_id WHERE f.path = ? AND r.root_path = ?"
+    let fidSql = "SELECT f.id FROM files f JOIN repos r ON r.id = f.repo_id WHERE f.path = ? AND r.id = ?"
     var fidStmt: OpaquePointer?
     var targetFileId: String?
     if sqlite3_prepare_v2(db, fidSql, -1, &fidStmt, nil) == SQLITE_OK, let s = fidStmt {
       defer { sqlite3_finalize(s) }
       bindText(s, 1, filePath)
-      bindText(s, 2, repoPath)
+      bindText(s, 2, resolvedRepoId)
       if sqlite3_step(s) == SQLITE_ROW, let t = sqlite3_column_text(s, 0) {
         targetFileId = String(cString: t)
       }
@@ -313,11 +315,11 @@ extension RAGStore {
       JOIN files sf ON sf.id = d.source_file_id
       JOIN repos r ON r.id = d.repo_id
       LEFT JOIN files tf ON tf.id = d.target_file_id
-      WHERE r.root_path = ? AND (d.target_file_id = ? OR d.target_path = ? OR d.target_path LIKE ?)
+      WHERE r.id = ? AND (d.target_file_id = ? OR d.target_path = ? OR d.target_path LIKE ?)
       ORDER BY sf.path
       """
     return try queryDeps(sql: sql) { stmt in
-      bindText(stmt, 1, repoPath)
+      bindText(stmt, 1, resolvedRepoId)
       bindText(stmt, 2, targetFileId ?? "")
       bindText(stmt, 3, filePath)
       bindText(stmt, 4, "%/\(filePath)")
@@ -327,27 +329,29 @@ extension RAGStore {
   /// Get all dependency edges for a repo.
   public func getDependencyEdges(for repoPath: String) throws -> [RAGDependencyResult] {
     try openIfNeeded()
+    let resolvedRepoId = try resolveRepoId(for: repoPath)
     let sql = """
       SELECT sf.path, d.target_path, tf.path, d.dependency_type, d.raw_import
       FROM dependencies d
       JOIN files sf ON sf.id = d.source_file_id
       JOIN repos r ON r.id = d.repo_id
       LEFT JOIN files tf ON tf.id = d.target_file_id
-      WHERE r.root_path = ? ORDER BY sf.path
+      WHERE r.id = ? ORDER BY sf.path
       """
-    return try queryDeps(sql: sql) { stmt in bindText(stmt, 1, repoPath) }
+    return try queryDeps(sql: sql) { stmt in bindText(stmt, 1, resolvedRepoId) }
   }
 
   /// Get file summaries for graph aggregation.
   public func getFileSummaries(for repoPath: String) throws -> [RAGFileSummary] {
     try openIfNeeded()
     guard let db else { throw RAGError.sqlite("Database not initialized") }
-    let sql = "SELECT f.path, f.language, f.module_path FROM files f JOIN repos r ON r.id = f.repo_id WHERE r.root_path = ? ORDER BY f.path"
+    let resolvedRepoId = try resolveRepoId(for: repoPath)
+    let sql = "SELECT f.path, f.language, f.module_path FROM files f JOIN repos r ON r.id = f.repo_id WHERE r.id = ? ORDER BY f.path"
     var stmt: OpaquePointer?
     let result = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
     guard result == SQLITE_OK, let stmt else { throw RAGError.sqlite("Failed to prepare") }
     defer { sqlite3_finalize(stmt) }
-    bindText(stmt, 1, repoPath)
+    bindText(stmt, 1, resolvedRepoId)
 
     var files: [RAGFileSummary] = []
     while sqlite3_step(stmt) == SQLITE_ROW {
@@ -363,16 +367,17 @@ extension RAGStore {
   public func getDependencyStats(for repoPath: String) throws -> (totalDeps: Int, byType: [String: Int]) {
     try openIfNeeded()
     guard let db else { throw RAGError.sqlite("Database not initialized") }
+    let resolvedRepoId = try resolveRepoId(for: repoPath)
     let sql = """
       SELECT d.dependency_type, COUNT(*) FROM dependencies d
-      JOIN repos r ON r.id = d.repo_id WHERE r.root_path = ?
+      JOIN repos r ON r.id = d.repo_id WHERE r.id = ?
       GROUP BY d.dependency_type
       """
     var stmt: OpaquePointer?
     let result = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
     guard result == SQLITE_OK, let stmt else { throw RAGError.sqlite("Failed to prepare") }
     defer { sqlite3_finalize(stmt) }
-    bindText(stmt, 1, repoPath)
+    bindText(stmt, 1, resolvedRepoId)
 
     var byType: [String: Int] = [:]
     var total = 0

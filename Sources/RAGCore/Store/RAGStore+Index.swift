@@ -46,7 +46,12 @@ extension RAGStore {
     if workspaceRepos.count >= 2 && !allowWorkspace {
       let subPackages = detectSubPackages(rootURL: repoURL, excludingGitRepos: workspaceRepos)
       let allSubPaths = workspaceRepos + subPackages
-      let parentRepoId = VectorMath.stableId(for: path)
+      let parentRepoId: String
+      if let resolved = try resolveRepo(for: path) {
+        parentRepoId = resolved.id
+      } else {
+        parentRepoId = VectorMath.stableId(for: path)
+      }
       let parentName = repoURL.lastPathComponent
       let now = dateFormatter.string(from: Date())
       let parentIdentifier = Self.discoverNormalizedRemoteURL(for: path)
@@ -61,7 +66,12 @@ extension RAGStore {
       print("[RAG] Workspace detected at \(path): auto-indexing \(allSubPaths.count) sub-packages")
       for (idx, subPath) in allSubPaths.enumerated() {
         let subURL = URL(fileURLWithPath: subPath)
-        let subRepoId = VectorMath.stableId(for: subPath)
+        let subRepoId: String
+        if let resolved = try resolveRepo(for: subPath) {
+          subRepoId = resolved.id
+        } else {
+          subRepoId = VectorMath.stableId(for: subPath)
+        }
         let subName = subURL.lastPathComponent
         print("[RAG] Indexing sub-package \(idx + 1)/\(allSubPaths.count): \(subName)")
 
@@ -116,7 +126,12 @@ extension RAGStore {
     logMemory("after scan \(scannedFiles.count) files")
     progress?(.scanning(fileCount: scannedFiles.count))
 
-    let repoId = VectorMath.stableId(for: path)
+    let repoId: String
+    if let resolved = try resolveRepo(for: path) {
+      repoId = resolved.id
+    } else {
+      repoId = VectorMath.stableId(for: path)
+    }
     let repoName = repoURL.lastPathComponent
     let now = dateFormatter.string(from: Date())
     let repoIdentifier = Self.discoverNormalizedRemoteURL(for: path)

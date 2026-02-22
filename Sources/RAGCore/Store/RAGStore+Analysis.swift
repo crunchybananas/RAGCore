@@ -27,16 +27,19 @@ extension RAGStore {
     try openIfNeeded()
 
     let sql: String
+    let resolvedRepoId: String?
     if let repoPath {
+      resolvedRepoId = try resolveRepoId(for: repoPath)
       sql = """
         SELECT c.id, c.text, c.construct_type, c.construct_name, f.language
         FROM chunks c
         JOIN files f ON c.file_id = f.id
         JOIN repos r ON f.repo_id = r.id
-        WHERE c.ai_summary IS NULL AND r.root_path = ?
+        WHERE c.ai_summary IS NULL AND r.id = ?
         LIMIT ?
         """
     } else {
+      resolvedRepoId = nil
       sql = """
         SELECT c.id, c.text, c.construct_type, c.construct_name, f.language
         FROM chunks c
@@ -55,7 +58,7 @@ extension RAGStore {
     defer { sqlite3_finalize(statement) }
 
     var bindIndex: Int32 = 1
-    if let repoPath { bindText(statement, bindIndex, repoPath); bindIndex += 1 }
+    if let resolvedRepoId { bindText(statement, bindIndex, resolvedRepoId); bindIndex += 1 }
     sqlite3_bind_int(statement, bindIndex, Int32(limit))
 
     struct ChunkToAnalyze {
@@ -139,11 +142,12 @@ extension RAGStore {
   public func getUnanalyzedChunkCount(repoPath: String? = nil) throws -> Int {
     try openIfNeeded()
     if let repoPath {
+      let resolvedRepoId = try resolveRepoId(for: repoPath)
       return try queryInt("""
         SELECT COUNT(*) FROM chunks c
         JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id
-        WHERE c.ai_summary IS NULL AND r.root_path = ?
-        """, bind: { stmt in bindText(stmt, 1, repoPath) })
+        WHERE c.ai_summary IS NULL AND r.id = ?
+        """, bind: { stmt in bindText(stmt, 1, resolvedRepoId) })
     }
     return try queryInt("SELECT COUNT(*) FROM chunks WHERE ai_summary IS NULL")
   }
@@ -152,11 +156,12 @@ extension RAGStore {
   public func getAnalyzedChunkCount(repoPath: String? = nil) throws -> Int {
     try openIfNeeded()
     if let repoPath {
+      let resolvedRepoId = try resolveRepoId(for: repoPath)
       return try queryInt("""
         SELECT COUNT(*) FROM chunks c
         JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id
-        WHERE c.ai_summary IS NOT NULL AND r.root_path = ?
-        """, bind: { stmt in bindText(stmt, 1, repoPath) })
+        WHERE c.ai_summary IS NOT NULL AND r.id = ?
+        """, bind: { stmt in bindText(stmt, 1, resolvedRepoId) })
     }
     return try queryInt("SELECT COUNT(*) FROM chunks WHERE ai_summary IS NOT NULL")
   }
@@ -165,10 +170,11 @@ extension RAGStore {
   public func clearAnalysis(repoPath: String? = nil) throws {
     try openIfNeeded()
     if let repoPath {
+      let resolvedRepoId = try resolveRepoId(for: repoPath)
       try execute(sql: """
         UPDATE chunks SET ai_summary = NULL, ai_tags = NULL, analyzed_at = NULL, analyzer_model = NULL, enriched_at = NULL
-        WHERE file_id IN (SELECT f.id FROM files f JOIN repos r ON f.repo_id = r.id WHERE r.root_path = ?)
-        """) { stmt in self.bindText(stmt, 1, repoPath) }
+        WHERE file_id IN (SELECT f.id FROM files f JOIN repos r ON f.repo_id = r.id WHERE r.id = ?)
+        """) { stmt in self.bindText(stmt, 1, resolvedRepoId) }
     } else {
       try exec("UPDATE chunks SET ai_summary = NULL, ai_tags = NULL, analyzed_at = NULL, analyzer_model = NULL, enriched_at = NULL")
     }
@@ -186,14 +192,17 @@ extension RAGStore {
     try openIfNeeded()
 
     let sql: String
+    let resolvedRepoId: String?
     if let repoPath {
+      resolvedRepoId = try resolveRepoId(for: repoPath)
       sql = """
         SELECT c.id, c.text, c.ai_summary FROM chunks c
         JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id
-        WHERE c.ai_summary IS NOT NULL AND c.enriched_at IS NULL AND r.root_path = ?
+        WHERE c.ai_summary IS NOT NULL AND c.enriched_at IS NULL AND r.id = ?
         LIMIT ?
         """
     } else {
+      resolvedRepoId = nil
       sql = """
         SELECT c.id, c.text, c.ai_summary FROM chunks c
         WHERE c.ai_summary IS NOT NULL AND c.enriched_at IS NULL LIMIT ?
@@ -209,7 +218,7 @@ extension RAGStore {
     defer { sqlite3_finalize(statement) }
 
     var bindIndex: Int32 = 1
-    if let repoPath { bindText(statement, bindIndex, repoPath); bindIndex += 1 }
+    if let resolvedRepoId { bindText(statement, bindIndex, resolvedRepoId); bindIndex += 1 }
     sqlite3_bind_int(statement, bindIndex, Int32(limit))
 
     struct ChunkToEnrich { let id: String; let text: String; let aiSummary: String }
@@ -261,11 +270,12 @@ extension RAGStore {
   public func getUnenrichedChunkCount(repoPath: String? = nil) throws -> Int {
     try openIfNeeded()
     if let repoPath {
+      let resolvedRepoId = try resolveRepoId(for: repoPath)
       return try queryInt("""
         SELECT COUNT(*) FROM chunks c
         JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id
-        WHERE c.ai_summary IS NOT NULL AND c.enriched_at IS NULL AND r.root_path = ?
-        """, bind: { stmt in bindText(stmt, 1, repoPath) })
+        WHERE c.ai_summary IS NOT NULL AND c.enriched_at IS NULL AND r.id = ?
+        """, bind: { stmt in bindText(stmt, 1, resolvedRepoId) })
     }
     return try queryInt("SELECT COUNT(*) FROM chunks WHERE ai_summary IS NOT NULL AND enriched_at IS NULL")
   }
@@ -274,11 +284,12 @@ extension RAGStore {
   public func getEnrichedChunkCount(repoPath: String? = nil) throws -> Int {
     try openIfNeeded()
     if let repoPath {
+      let resolvedRepoId = try resolveRepoId(for: repoPath)
       return try queryInt("""
         SELECT COUNT(*) FROM chunks c
         JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id
-        WHERE c.enriched_at IS NOT NULL AND r.root_path = ?
-        """, bind: { stmt in bindText(stmt, 1, repoPath) })
+        WHERE c.enriched_at IS NOT NULL AND r.id = ?
+        """, bind: { stmt in bindText(stmt, 1, resolvedRepoId) })
     }
     return try queryInt("SELECT COUNT(*) FROM chunks WHERE enriched_at IS NOT NULL")
   }
@@ -293,6 +304,7 @@ extension RAGStore {
   ) throws -> [DuplicateGroup] {
     try openIfNeeded()
     guard let db else { throw RAGError.sqlite("Database not initialized") }
+    let resolvedRepoId: String? = if let repoPath { try resolveRepoId(for: repoPath) } else { nil }
 
     var sql = """
       SELECT c.construct_name, c.construct_type,
@@ -304,7 +316,7 @@ extension RAGStore {
       JOIN repos r ON f.repo_id = r.id
       WHERE c.construct_name IS NOT NULL AND c.token_count >= ?
       """
-    if repoPath != nil { sql += " AND r.root_path = ?" }
+    if resolvedRepoId != nil { sql += " AND r.id = ?" }
     sql += """
        GROUP BY c.construct_name, c.construct_type
        HAVING COUNT(DISTINCT f.id) > 1
@@ -321,7 +333,7 @@ extension RAGStore {
 
     var bindIdx: Int32 = 1
     sqlite3_bind_int(stmt, bindIdx, Int32(minTokens)); bindIdx += 1
-    if let repoPath { bindText(stmt, bindIdx, repoPath); bindIdx += 1 }
+    if let resolvedRepoId { bindText(stmt, bindIdx, resolvedRepoId); bindIdx += 1 }
     sqlite3_bind_int(stmt, bindIdx, Int32(limit))
 
     var groups: [DuplicateGroup] = []
@@ -353,6 +365,7 @@ extension RAGStore {
   ) throws -> [PatternGroup] {
     try openIfNeeded()
     guard let db else { throw RAGError.sqlite("Database not initialized") }
+    let resolvedRepoId: String? = if let repoPath { try resolveRepoId(for: repoPath) } else { nil }
 
     var sql = """
       SELECT c.construct_name, c.construct_type, f.path, c.token_count
@@ -361,7 +374,7 @@ extension RAGStore {
       JOIN repos r ON f.repo_id = r.id
       WHERE c.construct_name IS NOT NULL AND c.construct_type IS NOT NULL
       """
-    if repoPath != nil { sql += " AND r.root_path = ?" }
+    if resolvedRepoId != nil { sql += " AND r.id = ?" }
     sql += " ORDER BY c.construct_name"
 
     var stmt: OpaquePointer?
@@ -371,7 +384,7 @@ extension RAGStore {
     }
     defer { sqlite3_finalize(stmt) }
 
-    if let repoPath { bindText(stmt, 1, repoPath) }
+    if let resolvedRepoId { bindText(stmt, 1, resolvedRepoId) }
 
     // Collect construct names and group by suffixes
     let commonSuffixes = ["ViewModel", "View", "Service", "Controller", "Manager", "Handler", "Provider", "Factory", "Helper", "Delegate", "DataSource", "Store", "Router", "Coordinator", "Presenter", "Interactor", "UseCase", "Repository", "Adapter", "Builder", "Configurator", "Validator", "Formatter", "Parser", "Serializer"]
@@ -414,6 +427,7 @@ extension RAGStore {
   ) throws -> [Hotspot] {
     try openIfNeeded()
     guard let db else { throw RAGError.sqlite("Database not initialized") }
+    let resolvedRepoId: String? = if let repoPath { try resolveRepoId(for: repoPath) } else { nil }
 
     var sql = """
       SELECT c.construct_name, c.construct_type, f.path, c.token_count,
@@ -423,7 +437,7 @@ extension RAGStore {
       JOIN repos r ON f.repo_id = r.id
       WHERE c.token_count >= ?
       """
-    if repoPath != nil { sql += " AND r.root_path = ?" }
+    if resolvedRepoId != nil { sql += " AND r.id = ?" }
     sql += " ORDER BY c.token_count DESC LIMIT ?"
 
     var stmt: OpaquePointer?
@@ -435,7 +449,7 @@ extension RAGStore {
 
     var bindIdx: Int32 = 1
     sqlite3_bind_int(stmt, bindIdx, Int32(tokenThreshold)); bindIdx += 1
-    if let repoPath { bindText(stmt, bindIdx, repoPath); bindIdx += 1 }
+    if let resolvedRepoId { bindText(stmt, bindIdx, resolvedRepoId); bindIdx += 1 }
     sqlite3_bind_int(stmt, bindIdx, Int32(limit))
 
     var hotspots: [Hotspot] = []
@@ -467,12 +481,13 @@ extension RAGStore {
   /// Get construct type distribution.
   public func getConstructTypeStats(repoPath: String? = nil) throws -> [(type: String, count: Int)] {
     try openIfNeeded()
+    let resolvedRepoId: String? = if let repoPath { try resolveRepoId(for: repoPath) } else { nil }
     let sql: String
-    if repoPath != nil {
+    if resolvedRepoId != nil {
       sql = """
         SELECT COALESCE(c.construct_type, 'unknown') as type, COUNT(*) as cnt
         FROM chunks c JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id
-        WHERE r.root_path = ? GROUP BY type ORDER BY cnt DESC
+        WHERE r.id = ? GROUP BY type ORDER BY cnt DESC
         """
     } else {
       sql = "SELECT COALESCE(construct_type, 'unknown') as type, COUNT(*) as cnt FROM chunks GROUP BY type ORDER BY cnt DESC"
@@ -482,7 +497,7 @@ extension RAGStore {
     let result = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
     guard result == SQLITE_OK, let stmt else { throw RAGError.sqlite(String(cString: sqlite3_errmsg(db))) }
     defer { sqlite3_finalize(stmt) }
-    if let repoPath { bindText(stmt, 1, repoPath) }
+    if let resolvedRepoId { bindText(stmt, 1, resolvedRepoId) }
 
     var stats: [(type: String, count: Int)] = []
     while sqlite3_step(stmt) == SQLITE_ROW {
@@ -494,6 +509,7 @@ extension RAGStore {
   /// Get facet counts for filtering/grouping.
   public func getFacets(repoPath: String? = nil) throws -> FacetCounts {
     try openIfNeeded()
+    let resolvedRepoId: String? = if let repoPath { try resolveRepoId(for: repoPath) } else { nil }
 
     func facetQuery(_ sql: String) throws -> [(String, Int)] {
       guard let db else { throw RAGError.sqlite("Database not initialized") }
@@ -501,7 +517,7 @@ extension RAGStore {
       let r = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
       guard r == SQLITE_OK, let stmt else { throw RAGError.sqlite(String(cString: sqlite3_errmsg(db))) }
       defer { sqlite3_finalize(stmt) }
-      if let repoPath { bindText(stmt, 1, repoPath) }
+      if let resolvedRepoId { bindText(stmt, 1, resolvedRepoId) }
       var results: [(String, Int)] = []
       while sqlite3_step(stmt) == SQLITE_ROW {
         results.append((String(cString: sqlite3_column_text(stmt, 0)), Int(sqlite3_column_int(stmt, 1))))
@@ -509,14 +525,14 @@ extension RAGStore {
       return results
     }
 
-    let moduleSql = repoPath != nil
-      ? "SELECT f.module_path, COUNT(*) FROM files f JOIN repos r ON f.repo_id = r.id WHERE r.root_path = ? AND f.module_path IS NOT NULL GROUP BY f.module_path ORDER BY COUNT(*) DESC"
+    let moduleSql = resolvedRepoId != nil
+      ? "SELECT f.module_path, COUNT(*) FROM files f JOIN repos r ON f.repo_id = r.id WHERE r.id = ? AND f.module_path IS NOT NULL GROUP BY f.module_path ORDER BY COUNT(*) DESC"
       : "SELECT module_path, COUNT(*) FROM files WHERE module_path IS NOT NULL GROUP BY module_path ORDER BY COUNT(*) DESC"
-    let langSql = repoPath != nil
-      ? "SELECT f.language, COUNT(*) FROM files f JOIN repos r ON f.repo_id = r.id WHERE r.root_path = ? AND f.language IS NOT NULL GROUP BY f.language ORDER BY COUNT(*) DESC"
+    let langSql = resolvedRepoId != nil
+      ? "SELECT f.language, COUNT(*) FROM files f JOIN repos r ON f.repo_id = r.id WHERE r.id = ? AND f.language IS NOT NULL GROUP BY f.language ORDER BY COUNT(*) DESC"
       : "SELECT language, COUNT(*) FROM files WHERE language IS NOT NULL GROUP BY language ORDER BY COUNT(*) DESC"
-    let ctSql = repoPath != nil
-      ? "SELECT COALESCE(c.construct_type, 'unknown'), COUNT(*) FROM chunks c JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id WHERE r.root_path = ? GROUP BY c.construct_type ORDER BY COUNT(*) DESC"
+    let ctSql = resolvedRepoId != nil
+      ? "SELECT COALESCE(c.construct_type, 'unknown'), COUNT(*) FROM chunks c JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id WHERE r.id = ? GROUP BY c.construct_type ORDER BY COUNT(*) DESC"
       : "SELECT COALESCE(construct_type, 'unknown'), COUNT(*) FROM chunks GROUP BY construct_type ORDER BY COUNT(*) DESC"
 
     let modules = try facetQuery(moduleSql)
@@ -524,7 +540,7 @@ extension RAGStore {
     let constructTypes = try facetQuery(ctSql)
 
     // Feature tags need JSON parsing
-    let featureTags = try queryFeatureTagCounts(repoPath: repoPath)
+    let featureTags = try queryFeatureTagCounts(resolvedRepoId: resolvedRepoId)
 
     return FacetCounts(
       modulePaths: modules.map { ($0.0, $0.1) },
@@ -534,17 +550,17 @@ extension RAGStore {
     )
   }
 
-  internal func queryFeatureTagCounts(repoPath: String?) throws -> [(tag: String, count: Int)] {
+  internal func queryFeatureTagCounts(resolvedRepoId: String?) throws -> [(tag: String, count: Int)] {
     guard let db else { throw RAGError.sqlite("Database not initialized") }
-    let sql = repoPath != nil
-      ? "SELECT f.feature_tags FROM files f JOIN repos r ON f.repo_id = r.id WHERE r.root_path = ? AND f.feature_tags IS NOT NULL"
+    let sql = resolvedRepoId != nil
+      ? "SELECT f.feature_tags FROM files f JOIN repos r ON f.repo_id = r.id WHERE r.id = ? AND f.feature_tags IS NOT NULL"
       : "SELECT feature_tags FROM files WHERE feature_tags IS NOT NULL"
 
     var stmt: OpaquePointer?
     let result = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
     guard result == SQLITE_OK, let stmt else { throw RAGError.sqlite(String(cString: sqlite3_errmsg(db))) }
     defer { sqlite3_finalize(stmt) }
-    if let repoPath { bindText(stmt, 1, repoPath) }
+    if let resolvedRepoId { bindText(stmt, 1, resolvedRepoId) }
 
     var tagCounts: [String: Int] = [:]
     while sqlite3_step(stmt) == SQLITE_ROW {
@@ -560,12 +576,13 @@ extension RAGStore {
   /// Get largest files by chunk count.
   public func getLargeFiles(repoPath: String? = nil, limit: Int = 20) throws -> [(path: String, chunkCount: Int, totalLines: Int, language: String?)] {
     try openIfNeeded()
+    let resolvedRepoId: String? = if let repoPath { try resolveRepoId(for: repoPath) } else { nil }
     let sql: String
-    if repoPath != nil {
+    if resolvedRepoId != nil {
       sql = """
         SELECT r.root_path || '/' || f.path, COUNT(*), SUM(c.end_line - c.start_line), f.language
         FROM chunks c JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id
-        WHERE r.root_path = ? GROUP BY f.id ORDER BY SUM(c.end_line - c.start_line) DESC LIMIT ?
+        WHERE r.id = ? GROUP BY f.id ORDER BY SUM(c.end_line - c.start_line) DESC LIMIT ?
         """
     } else {
       sql = """
@@ -581,7 +598,7 @@ extension RAGStore {
     guard result == SQLITE_OK, let stmt else { throw RAGError.sqlite(String(cString: sqlite3_errmsg(db))) }
     defer { sqlite3_finalize(stmt) }
 
-    if let repoPath { bindText(stmt, 1, repoPath); sqlite3_bind_int(stmt, 2, Int32(limit)) }
+    if let resolvedRepoId { bindText(stmt, 1, resolvedRepoId); sqlite3_bind_int(stmt, 2, Int32(limit)) }
     else { sqlite3_bind_int(stmt, 1, Int32(limit)) }
 
     var files: [(path: String, chunkCount: Int, totalLines: Int, language: String?)] = []
@@ -599,10 +616,11 @@ extension RAGStore {
   public func getIndexStats(repoPath: String? = nil) throws -> (fileCount: Int, chunkCount: Int, embeddingCount: Int, totalLines: Int) {
     try openIfNeeded()
     if let repoPath {
-      let fc = try queryInt("SELECT COUNT(*) FROM files f JOIN repos r ON f.repo_id = r.id WHERE r.root_path = ?", bind: { s in bindText(s, 1, repoPath) })
-      let cc = try queryInt("SELECT COUNT(*) FROM chunks c JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id WHERE r.root_path = ?", bind: { s in bindText(s, 1, repoPath) })
-      let ec = try queryInt("SELECT COUNT(*) FROM embeddings e JOIN chunks c ON e.chunk_id = c.id JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id WHERE r.root_path = ?", bind: { s in bindText(s, 1, repoPath) })
-      let tl = try queryInt("SELECT COALESCE(SUM(c.end_line - c.start_line), 0) FROM chunks c JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id WHERE r.root_path = ?", bind: { s in bindText(s, 1, repoPath) })
+      let resolvedRepoId = try resolveRepoId(for: repoPath)
+      let fc = try queryInt("SELECT COUNT(*) FROM files f JOIN repos r ON f.repo_id = r.id WHERE r.id = ?", bind: { s in bindText(s, 1, resolvedRepoId) })
+      let cc = try queryInt("SELECT COUNT(*) FROM chunks c JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id WHERE r.id = ?", bind: { s in bindText(s, 1, resolvedRepoId) })
+      let ec = try queryInt("SELECT COUNT(*) FROM embeddings e JOIN chunks c ON e.chunk_id = c.id JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id WHERE r.id = ?", bind: { s in bindText(s, 1, resolvedRepoId) })
+      let tl = try queryInt("SELECT COALESCE(SUM(c.end_line - c.start_line), 0) FROM chunks c JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id WHERE r.id = ?", bind: { s in bindText(s, 1, resolvedRepoId) })
       return (fc, cc, ec, tl)
     }
     return (
