@@ -56,7 +56,16 @@ extension RAGStore {
       let now = dateFormatter.string(from: Date())
       let parentIdentifier = Self.discoverNormalizedRemoteURL(for: path)
 
-      try upsertRepo(id: parentRepoId, name: parentName, rootPath: path, lastIndexedAt: now, repoIdentifier: parentIdentifier, parentRepoId: nil)
+      try upsertRepo(
+        id: parentRepoId,
+        name: parentName,
+        rootPath: path,
+        lastIndexedAt: now,
+        repoIdentifier: parentIdentifier,
+        parentRepoId: nil,
+        embeddingModel: nil,
+        embeddingDimensions: nil
+      )
 
       var subReports: [RAGIndexReport] = []
       var totalFiles = 0, totalSkipped = 0, totalRemoved = 0, totalChunks = 0
@@ -77,7 +86,16 @@ extension RAGStore {
 
         let subIdentifier = Self.discoverNormalizedRemoteURL(for: subPath)
         let subNow = dateFormatter.string(from: Date())
-        try upsertRepo(id: subRepoId, name: subName, rootPath: subPath, lastIndexedAt: subNow, repoIdentifier: subIdentifier, parentRepoId: parentRepoId)
+        try upsertRepo(
+          id: subRepoId,
+          name: subName,
+          rootPath: subPath,
+          lastIndexedAt: subNow,
+          repoIdentifier: subIdentifier,
+          parentRepoId: parentRepoId,
+          embeddingModel: embeddingProvider.modelName,
+          embeddingDimensions: embeddingProvider.dimensions
+        )
 
         let subReport = try await indexRepository(
           path: subPath,
@@ -136,7 +154,16 @@ extension RAGStore {
     let now = dateFormatter.string(from: Date())
     let repoIdentifier = Self.discoverNormalizedRemoteURL(for: path)
 
-    try upsertRepo(id: repoId, name: repoName, rootPath: path, lastIndexedAt: now, repoIdentifier: repoIdentifier)
+    try upsertRepo(
+      id: repoId,
+      name: repoName,
+      rootPath: path,
+      lastIndexedAt: now,
+      repoIdentifier: repoIdentifier,
+      parentRepoId: nil,
+      embeddingModel: embeddingProvider.modelName,
+      embeddingDimensions: embeddingProvider.dimensions
+    )
 
     var chunkCount = 0
     var bytesScanned = 0

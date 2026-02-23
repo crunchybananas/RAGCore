@@ -248,17 +248,21 @@ extension RAGStore {
     rootPath: String,
     lastIndexedAt: String?,
     repoIdentifier: String? = nil,
-    parentRepoId: String? = nil
+    parentRepoId: String? = nil,
+    embeddingModel: String? = nil,
+    embeddingDimensions: Int? = nil
   ) throws {
     let sql = """
-      INSERT INTO repos (id, name, root_path, last_indexed_at, repo_identifier, parent_repo_id)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO repos (id, name, root_path, last_indexed_at, repo_identifier, parent_repo_id, embedding_model, embedding_dimensions)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
         root_path = excluded.root_path,
         last_indexed_at = excluded.last_indexed_at,
         repo_identifier = COALESCE(excluded.repo_identifier, repos.repo_identifier),
-        parent_repo_id = excluded.parent_repo_id
+        parent_repo_id = excluded.parent_repo_id,
+        embedding_model = COALESCE(excluded.embedding_model, repos.embedding_model),
+        embedding_dimensions = COALESCE(excluded.embedding_dimensions, repos.embedding_dimensions)
       """
     try execute(sql: sql) { stmt in
       bindText(stmt, 1, id)
@@ -267,6 +271,12 @@ extension RAGStore {
       bindTextOrNull(stmt, 4, lastIndexedAt)
       bindTextOrNull(stmt, 5, repoIdentifier)
       bindTextOrNull(stmt, 6, parentRepoId)
+      bindTextOrNull(stmt, 7, embeddingModel)
+      if let embeddingDimensions {
+        sqlite3_bind_int(stmt, 8, Int32(embeddingDimensions))
+      } else {
+        sqlite3_bind_null(stmt, 8)
+      }
     }
   }
 

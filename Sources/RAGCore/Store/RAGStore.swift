@@ -15,7 +15,7 @@ import MachO
 /// Core actor for RAG (Retrieval-Augmented Generation) storage.
 ///
 /// Manages:
-/// - SQLite database with schema migrations (v1→v13)
+/// - SQLite database with schema migrations (v1→v14)
 /// - File scanning and chunking pipeline (AST + line-based)
 /// - Embedding generation and caching
 /// - Vector search (accelerated via sqlite-vec, or brute-force fallback)
@@ -92,6 +92,8 @@ public actor RAGStore {
     public let chunkCount: Int
     public let repoIdentifier: String?
     public let parentRepoId: String?
+    public let embeddingModel: String?
+    public let embeddingDimensions: Int?
   }
 
   public struct ChunkingHealthInfo: Sendable {
@@ -298,7 +300,9 @@ public actor RAGStore {
              (SELECT COUNT(*) FROM files WHERE repo_id = r.id) as file_count,
              (SELECT COUNT(*) FROM chunks c JOIN files f ON c.file_id = f.id WHERE f.repo_id = r.id) as chunk_count,
              r.repo_identifier,
-             r.parent_repo_id
+              r.parent_repo_id,
+              r.embedding_model,
+              r.embedding_dimensions
       FROM repos r
       ORDER BY r.name
       """
@@ -326,11 +330,19 @@ public actor RAGStore {
       let chunkCount = Int(sqlite3_column_int(statement, 5))
       let repoIdentifier = sqlite3_column_text(statement, 6).map { String(cString: $0) }
       let parentRepoId = sqlite3_column_text(statement, 7).map { String(cString: $0) }
+      let embeddingModel = sqlite3_column_text(statement, 8).map { String(cString: $0) }
+      let embeddingDimensions: Int?
+      if sqlite3_column_type(statement, 9) == SQLITE_NULL {
+        embeddingDimensions = nil
+      } else {
+        embeddingDimensions = Int(sqlite3_column_int(statement, 9))
+      }
 
       repos.append(RepoInfo(
         id: id, name: name, rootPath: rootPath, lastIndexedAt: lastIndexedAt,
         fileCount: fileCount, chunkCount: chunkCount,
-        repoIdentifier: repoIdentifier, parentRepoId: parentRepoId
+        repoIdentifier: repoIdentifier, parentRepoId: parentRepoId,
+        embeddingModel: embeddingModel, embeddingDimensions: embeddingDimensions
       ))
     }
     return repos
@@ -728,23 +740,47 @@ public actor RAGStore {
     guard let identifier = normalizedURL else { return nil }
 
     // 3. Match by repo_identifier
-    let identSql = "SELECT id, root_path FROM repos WHERE repo_identifier = ? LIMIT 1"
+    // IMPORTANT: A single remote URL can map to multiple local repo entries
+    // (e.g. monorepo subpaths). Avoid arbitrarily picking one with LIMIT 1.
+    let identSql = "SELECT id, root_path FROM repos WHERE repo_identifier = ?"
     stmt = nil
     if sqlite3_prepare_v2(db, identSql, -1, &stmt, nil) == SQLITE_OK, let s = stmt {
       defer { sqlite3_finalize(s) }
       bindText(s, 1, identifier)
-      if sqlite3_step(s) == SQLITE_ROW {
+
+      var matches: [(id: String, path: String)] = []
+      while sqlite3_step(s) == SQLITE_ROW {
         let repoId = String(cString: sqlite3_column_text(s, 0))
         let storedPath = String(cString: sqlite3_column_text(s, 1))
-
-        // 4. Auto-update root_path if it differs (repo moved or synced from another machine)
-        if storedPath != repoPath {
-          let escapedPath = repoPath.replacingOccurrences(of: "'", with: "''")
-          try? exec("UPDATE repos SET root_path = '\(escapedPath)' WHERE id = '\(repoId)'")
-          print("[RAG] Auto-remapped repo \(identifier): \(storedPath) → \(repoPath)")
-        }
-        return ResolvedRepo(id: repoId, rootPath: repoPath)
+        matches.append((id: repoId, path: storedPath))
       }
+
+      guard !matches.isEmpty else { return nil }
+
+      let selected: (id: String, path: String)?
+      if matches.count == 1 {
+        selected = matches[0]
+      } else {
+        let targetName = URL(fileURLWithPath: repoPath).lastPathComponent
+        let basenameMatches = matches.filter { URL(fileURLWithPath: $0.path).lastPathComponent == targetName }
+
+        if basenameMatches.count == 1 {
+          selected = basenameMatches[0]
+        } else {
+          print("[RAG] Ambiguous repo_identifier match for \(identifier) at \(repoPath); skipping auto-remap")
+          selected = nil
+        }
+      }
+
+      guard let selected else { return nil }
+
+      // 4. Auto-update root_path if it differs (repo moved or synced from another machine)
+      if selected.path != repoPath {
+        let escapedPath = repoPath.replacingOccurrences(of: "'", with: "''")
+        try? exec("UPDATE repos SET root_path = '\(escapedPath)' WHERE id = '\(selected.id)'")
+        print("[RAG] Auto-remapped repo \(identifier): \(selected.path) → \(repoPath)")
+      }
+      return ResolvedRepo(id: selected.id, rootPath: repoPath)
     }
 
     return nil

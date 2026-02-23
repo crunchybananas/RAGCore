@@ -2,7 +2,7 @@
 //  RAGStore+Schema.swift
 //  RAGCore
 //
-//  Schema management and migrations (v1→v13).
+//  Schema management and migrations (v1→v15).
 //
 
 import CSQLite
@@ -67,7 +67,7 @@ extension RAGStore {
   // MARK: - Schema
 
   internal func ensureSchema() throws {
-    guard let db else { throw RAGError.sqlite("Database not initialized") }
+    guard db != nil else { throw RAGError.sqlite("Database not initialized") }
 
     // Create rag_meta table if needed
     try exec("""
@@ -304,6 +304,109 @@ extension RAGStore {
       try setSchemaVersion(13)
     }
 
+    if schemaVersion < 14 {
+      if !columnExists("repos", column: "embedding_model") {
+        try exec("ALTER TABLE repos ADD COLUMN embedding_model TEXT")
+      }
+      if !columnExists("repos", column: "embedding_dimensions") {
+        try exec("ALTER TABLE repos ADD COLUMN embedding_dimensions INTEGER")
+      }
+      backfillRepoEmbeddingDimensionsSync()
+      try setSchemaVersion(14)
+    }
+
+    if schemaVersion < 15 || !isCanonicalRagQueryHintsSchema() {
+      // Repair legacy rag_query_hints shapes into canonical schema used by
+      // recordQueryHint/fetchQueryHints:
+      //   id, query, result_count, search_mode, created_at
+      let hintColumns = tableColumns("rag_query_hints")
+      let requiredColumns: Set<String> = ["id", "query", "result_count", "search_mode", "created_at"]
+
+      if !hintColumns.isEmpty && !requiredColumns.isSubset(of: hintColumns) {
+        try exec("DROP TABLE IF EXISTS rag_query_hints_legacy_v15")
+        try exec("ALTER TABLE rag_query_hints RENAME TO rag_query_hints_legacy_v15")
+
+        try exec("""
+          CREATE TABLE rag_query_hints (
+            id TEXT PRIMARY KEY,
+            query TEXT NOT NULL,
+            result_count INTEGER NOT NULL DEFAULT 0,
+            search_mode TEXT NOT NULL DEFAULT 'vector',
+            created_at TEXT NOT NULL
+          )
+          """)
+
+        let legacyColumns = tableColumns("rag_query_hints_legacy_v15")
+        let idExpr = legacyColumns.contains("id") ? "id" : "lower(hex(randomblob(16)))"
+        let resultCountExpr = legacyColumns.contains("result_count") ? "result_count" : "0"
+        let searchModeExpr: String
+        if legacyColumns.contains("search_mode") {
+          searchModeExpr = "search_mode"
+        } else if legacyColumns.contains("mode") {
+          searchModeExpr = "mode"
+        } else {
+          searchModeExpr = "'vector'"
+        }
+        let createdAtExpr: String
+        if legacyColumns.contains("created_at") {
+          createdAtExpr = "created_at"
+        } else if legacyColumns.contains("last_used_at") {
+          createdAtExpr = "last_used_at"
+        } else {
+          createdAtExpr = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+        }
+
+        try exec("""
+          INSERT INTO rag_query_hints (id, query, result_count, search_mode, created_at)
+          SELECT
+            COALESCE(NULLIF(
+              \(idExpr),
+              ''
+            ), lower(hex(randomblob(16)))),
+            query,
+            COALESCE(\(resultCountExpr), 0),
+            COALESCE(NULLIF(\(searchModeExpr), ''), 'vector'),
+            COALESCE(NULLIF(\(createdAtExpr), ''), strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+          FROM rag_query_hints_legacy_v15
+          WHERE query IS NOT NULL
+          """)
+
+        try exec("DROP TABLE rag_query_hints_legacy_v15")
+      } else {
+        try exec("""
+          CREATE TABLE IF NOT EXISTS rag_query_hints (
+            id TEXT PRIMARY KEY,
+            query TEXT NOT NULL,
+            result_count INTEGER NOT NULL DEFAULT 0,
+            search_mode TEXT NOT NULL DEFAULT 'vector',
+            created_at TEXT NOT NULL
+          )
+          """)
+        if !columnExists("rag_query_hints", column: "id") {
+          try exec("ALTER TABLE rag_query_hints ADD COLUMN id TEXT")
+        }
+        if !columnExists("rag_query_hints", column: "search_mode") {
+          try exec("ALTER TABLE rag_query_hints ADD COLUMN search_mode TEXT NOT NULL DEFAULT 'vector'")
+        }
+        if !columnExists("rag_query_hints", column: "created_at") {
+          try exec("ALTER TABLE rag_query_hints ADD COLUMN created_at TEXT")
+        }
+      }
+
+      try exec("""
+        UPDATE rag_query_hints
+        SET
+          id = COALESCE(NULLIF(id, ''), lower(hex(randomblob(16)))),
+          search_mode = COALESCE(NULLIF(search_mode, ''), 'vector'),
+          created_at = COALESCE(NULLIF(created_at, ''), strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        """)
+
+      try exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_rag_query_hints_id ON rag_query_hints(id)")
+      try exec("CREATE INDEX IF NOT EXISTS idx_rag_query_hints_created_at ON rag_query_hints(created_at DESC)")
+
+      try setSchemaVersion(15)
+    }
+
     // Set up vec table if extension is loaded
     if extensionLoaded {
       try ensureVecTable()
@@ -398,6 +501,42 @@ extension RAGStore {
     }
   }
 
+  /// Backfill embedding dimensions for repos by sampling stored embedding blobs.
+  internal func backfillRepoEmbeddingDimensionsSync() {
+    guard let db else { return }
+    let sql = """
+      SELECT f.repo_id, CAST(LENGTH(e.embedding) / 4 AS INTEGER) AS dims
+      FROM embeddings e
+      JOIN chunks c ON c.id = e.chunk_id
+      JOIN files f ON f.id = c.file_id
+      GROUP BY f.repo_id
+      """
+    var stmt: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return }
+    defer { sqlite3_finalize(stmt) }
+
+    var updates: [(repoId: String, dims: Int)] = []
+    while sqlite3_step(stmt) == SQLITE_ROW {
+      let repoId = String(cString: sqlite3_column_text(stmt, 0))
+      let dims = Int(sqlite3_column_int(stmt, 1))
+      updates.append((repoId: repoId, dims: dims))
+    }
+
+    for update in updates {
+      let updateSql = "UPDATE repos SET embedding_dimensions = COALESCE(embedding_dimensions, ?) WHERE id = ?"
+      var updateStmt: OpaquePointer?
+      guard sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK, let updateStmt else { continue }
+      defer { sqlite3_finalize(updateStmt) }
+      sqlite3_bind_int(updateStmt, 1, Int32(update.dims))
+      sqlite3_bind_text(updateStmt, 2, update.repoId, -1, sqliteTransient)
+      sqlite3_step(updateStmt)
+    }
+
+    if !updates.isEmpty {
+      print("[RAG] Backfilled embedding dimensions for \(updates.count) repos")
+    }
+  }
+
   // MARK: - Schema Helpers
 
   internal func columnExists(_ table: String, column: String) -> Bool {
@@ -412,6 +551,28 @@ extension RAGStore {
       }
     }
     return false
+  }
+
+  internal func tableColumns(_ table: String) -> Set<String> {
+    guard let db else { return [] }
+    let sql = "PRAGMA table_info(\(table))"
+    var stmt: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
+    defer { sqlite3_finalize(stmt) }
+
+    var columns: Set<String> = []
+    while sqlite3_step(stmt) == SQLITE_ROW {
+      if let name = sqlite3_column_text(stmt, 1) {
+        columns.insert(String(cString: name))
+      }
+    }
+    return columns
+  }
+
+  internal func isCanonicalRagQueryHintsSchema() -> Bool {
+    let columns = tableColumns("rag_query_hints")
+    let required: Set<String> = ["id", "query", "result_count", "search_mode", "created_at"]
+    return !columns.isEmpty && required.isSubset(of: columns)
   }
 
   private func setSchemaVersion(_ version: Int) throws {
