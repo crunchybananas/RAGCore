@@ -63,8 +63,8 @@ extension RAGStore {
         lastIndexedAt: now,
         repoIdentifier: parentIdentifier,
         parentRepoId: nil,
-        embeddingModel: nil,
-        embeddingDimensions: nil
+        embeddingModel: embeddingProvider.modelName,
+        embeddingDimensions: embeddingProvider.dimensions
       )
 
       var subReports: [RAGIndexReport] = []
@@ -160,7 +160,6 @@ extension RAGStore {
       rootPath: path,
       lastIndexedAt: now,
       repoIdentifier: repoIdentifier,
-      parentRepoId: nil,
       embeddingModel: embeddingProvider.modelName,
       embeddingDimensions: embeddingProvider.dimensions
     )

@@ -92,7 +92,10 @@ public actor RAGStore {
     public let chunkCount: Int
     public let repoIdentifier: String?
     public let parentRepoId: String?
+    /// The embedding model used to generate this repo's vectors (e.g. "nomic-embed-text-v1.5").
+    /// Written during local indexing and during sync import.
     public let embeddingModel: String?
+    /// The dimensionality of stored embeddings (e.g. 768).
     public let embeddingDimensions: Int?
   }
 
@@ -300,9 +303,9 @@ public actor RAGStore {
              (SELECT COUNT(*) FROM files WHERE repo_id = r.id) as file_count,
              (SELECT COUNT(*) FROM chunks c JOIN files f ON c.file_id = f.id WHERE f.repo_id = r.id) as chunk_count,
              r.repo_identifier,
-              r.parent_repo_id,
-              r.embedding_model,
-              r.embedding_dimensions
+             r.parent_repo_id,
+             r.embedding_model,
+             r.embedding_dimensions
       FROM repos r
       ORDER BY r.name
       """
@@ -331,12 +334,8 @@ public actor RAGStore {
       let repoIdentifier = sqlite3_column_text(statement, 6).map { String(cString: $0) }
       let parentRepoId = sqlite3_column_text(statement, 7).map { String(cString: $0) }
       let embeddingModel = sqlite3_column_text(statement, 8).map { String(cString: $0) }
-      let embeddingDimensions: Int?
-      if sqlite3_column_type(statement, 9) == SQLITE_NULL {
-        embeddingDimensions = nil
-      } else {
-        embeddingDimensions = Int(sqlite3_column_int(statement, 9))
-      }
+      let embeddingDimensions: Int? = sqlite3_column_type(statement, 9) != SQLITE_NULL
+        ? Int(sqlite3_column_int(statement, 9)) : nil
 
       repos.append(RepoInfo(
         id: id, name: name, rootPath: rootPath, lastIndexedAt: lastIndexedAt,
