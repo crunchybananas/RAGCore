@@ -2,7 +2,7 @@
 //  RAGStore+Schema.swift
 //  RAGCore
 //
-//  Schema management and migrations (v1→v15).
+//  Schema management and migrations (v1→v16).
 //
 
 import CSQLite
@@ -407,6 +407,11 @@ extension RAGStore {
       try setSchemaVersion(15)
     }
 
+    if schemaVersion < 16 {
+      backfillRepoEmbeddingModelSync()
+      try setSchemaVersion(16)
+    }
+
     // Set up vec table if extension is loaded
     if extensionLoaded {
       try ensureVecTable()
@@ -534,6 +539,40 @@ extension RAGStore {
 
     if !updates.isEmpty {
       print("[RAG] Backfilled embedding dimensions for \(updates.count) repos")
+    }
+  }
+
+  /// Backfill embedding_model for repos that have dimensions but no model name.
+  /// Maps known MLX tier dimensions to their canonical model names.
+  internal func backfillRepoEmbeddingModelSync() {
+    guard let db else { return }
+
+    // Known dimension → model mappings for MLX embedding tiers
+    let dimensionToModel: [(dims: Int, model: String)] = [
+      (384, "all-MiniLM-L6-v2"),
+      (768, "nomic-embed-text-v1.5"),
+      (1024, "Qwen3-Embedding-0.6B-4bit"),
+    ]
+
+    var totalUpdated = 0
+    for mapping in dimensionToModel {
+      let sql = """
+        UPDATE repos
+        SET embedding_model = ?
+        WHERE embedding_model IS NULL
+          AND embedding_dimensions = ?
+        """
+      var stmt: OpaquePointer?
+      guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { continue }
+      defer { sqlite3_finalize(stmt) }
+      sqlite3_bind_text(stmt, 1, mapping.model, -1, sqliteTransient)
+      sqlite3_bind_int(stmt, 2, Int32(mapping.dims))
+      sqlite3_step(stmt)
+      totalUpdated += Int(sqlite3_changes(db))
+    }
+
+    if totalUpdated > 0 {
+      print("[RAG] Backfilled embedding_model for \(totalUpdated) repos from dimensions")
     }
   }
 
