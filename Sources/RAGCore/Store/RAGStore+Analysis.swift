@@ -107,6 +107,15 @@ extension RAGStore {
         analyzedCount += 1
       } catch {
         print("[RAG] Chunk analysis failed for \(chunk.id): \(error)")
+        // Mark the chunk so it won't be retried in the next batch
+        try? updateChunkAnalysis(
+          chunkId: chunk.id,
+          chunkText: chunk.text,
+          aiSummary: "[analysis-failed]",
+          aiTags: nil,
+          analyzedAt: now,
+          analyzerModel: "chunk-analyzer-failed"
+        )
       }
     }
 
