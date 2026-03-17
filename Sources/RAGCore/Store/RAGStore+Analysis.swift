@@ -9,6 +9,8 @@ import CSQLite
 import Foundation
 
 extension RAGStore {
+  private static let failedAnalysisSummary = "[analysis-failed]"
+  private static let failedAnalysisModel = "chunk-analyzer-failed"
 
   // MARK: - AI Chunk Analysis
 
@@ -35,7 +37,7 @@ extension RAGStore {
         FROM chunks c
         JOIN files f ON c.file_id = f.id
         JOIN repos r ON f.repo_id = r.id
-        WHERE c.ai_summary IS NULL AND r.id = ?
+        WHERE (c.ai_summary IS NULL OR c.analyzer_model = ? OR c.ai_summary = ?) AND r.id = ?
         LIMIT ?
         """
     } else {
@@ -44,7 +46,7 @@ extension RAGStore {
         SELECT c.id, c.text, c.construct_type, c.construct_name, f.language
         FROM chunks c
         JOIN files f ON c.file_id = f.id
-        WHERE c.ai_summary IS NULL
+        WHERE c.ai_summary IS NULL OR c.analyzer_model = ? OR c.ai_summary = ?
         LIMIT ?
         """
     }
@@ -58,6 +60,10 @@ extension RAGStore {
     defer { sqlite3_finalize(statement) }
 
     var bindIndex: Int32 = 1
+    bindText(statement, bindIndex, Self.failedAnalysisModel)
+    bindIndex += 1
+    bindText(statement, bindIndex, Self.failedAnalysisSummary)
+    bindIndex += 1
     if let resolvedRepoId { bindText(statement, bindIndex, resolvedRepoId); bindIndex += 1 }
     sqlite3_bind_int(statement, bindIndex, Int32(limit))
 
@@ -107,14 +113,14 @@ extension RAGStore {
         analyzedCount += 1
       } catch {
         print("[RAG] Chunk analysis failed for \(chunk.id): \(error)")
-        // Mark the chunk so it won't be retried in the next batch
+        // Persist the failure, but keep it retryable in later analyze passes.
         try? updateChunkAnalysis(
           chunkId: chunk.id,
           chunkText: chunk.text,
-          aiSummary: "[analysis-failed]",
+          aiSummary: Self.failedAnalysisSummary,
           aiTags: nil,
           analyzedAt: now,
-          analyzerModel: "chunk-analyzer-failed"
+          analyzerModel: Self.failedAnalysisModel
         )
       }
     }
@@ -132,7 +138,7 @@ extension RAGStore {
     analyzerModel: String
   ) throws {
     let sql = """
-      UPDATE chunks SET ai_summary = ?, ai_tags = ?, analyzed_at = ?, analyzer_model = ?
+      UPDATE chunks SET ai_summary = ?, ai_tags = ?, analyzed_at = ?, analyzer_model = ?, enriched_at = NULL
       WHERE id = ?
       """
     try execute(sql: sql) { stmt in
@@ -141,6 +147,10 @@ extension RAGStore {
       bindText(stmt, 3, analyzedAt)
       bindText(stmt, 4, analyzerModel)
       bindText(stmt, 5, chunkId)
+    }
+
+    guard analyzerModel != Self.failedAnalysisModel, aiSummary != Self.failedAnalysisSummary else {
+      return
     }
 
     let textHash = VectorMath.stableId(for: chunkText)
@@ -155,10 +165,20 @@ extension RAGStore {
       return try queryInt("""
         SELECT COUNT(*) FROM chunks c
         JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id
-        WHERE c.ai_summary IS NULL AND r.id = ?
-        """, bind: { stmt in bindText(stmt, 1, resolvedRepoId) })
+        WHERE (c.ai_summary IS NULL OR c.analyzer_model = ? OR c.ai_summary = ?) AND r.id = ?
+        """, bind: { stmt in
+          bindText(stmt, 1, Self.failedAnalysisModel)
+          bindText(stmt, 2, Self.failedAnalysisSummary)
+          bindText(stmt, 3, resolvedRepoId)
+        })
     }
-    return try queryInt("SELECT COUNT(*) FROM chunks WHERE ai_summary IS NULL")
+    return try queryInt(
+      "SELECT COUNT(*) FROM chunks WHERE ai_summary IS NULL OR analyzer_model = ? OR ai_summary = ?",
+      bind: { stmt in
+        bindText(stmt, 1, Self.failedAnalysisModel)
+        bindText(stmt, 2, Self.failedAnalysisSummary)
+      }
+    )
   }
 
   /// Get count of analyzed chunks.
@@ -169,10 +189,23 @@ extension RAGStore {
       return try queryInt("""
         SELECT COUNT(*) FROM chunks c
         JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id
-        WHERE c.ai_summary IS NOT NULL AND r.id = ?
-        """, bind: { stmt in bindText(stmt, 1, resolvedRepoId) })
+        WHERE c.ai_summary IS NOT NULL
+          AND c.analyzer_model != ?
+          AND c.ai_summary != ?
+          AND r.id = ?
+        """, bind: { stmt in
+          bindText(stmt, 1, Self.failedAnalysisModel)
+          bindText(stmt, 2, Self.failedAnalysisSummary)
+          bindText(stmt, 3, resolvedRepoId)
+        })
     }
-    return try queryInt("SELECT COUNT(*) FROM chunks WHERE ai_summary IS NOT NULL")
+    return try queryInt(
+      "SELECT COUNT(*) FROM chunks WHERE ai_summary IS NOT NULL AND analyzer_model != ? AND ai_summary != ?",
+      bind: { stmt in
+        bindText(stmt, 1, Self.failedAnalysisModel)
+        bindText(stmt, 2, Self.failedAnalysisSummary)
+      }
+    )
   }
 
   /// Clear AI analysis for all chunks in a repo (or all repos if nil).
@@ -207,14 +240,22 @@ extension RAGStore {
       sql = """
         SELECT c.id, c.text, c.ai_summary FROM chunks c
         JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id
-        WHERE c.ai_summary IS NOT NULL AND c.enriched_at IS NULL AND r.id = ?
+        WHERE c.ai_summary IS NOT NULL
+          AND c.analyzer_model != ?
+          AND c.ai_summary != ?
+          AND c.enriched_at IS NULL
+          AND r.id = ?
         LIMIT ?
         """
     } else {
       resolvedRepoId = nil
       sql = """
         SELECT c.id, c.text, c.ai_summary FROM chunks c
-        WHERE c.ai_summary IS NOT NULL AND c.enriched_at IS NULL LIMIT ?
+        WHERE c.ai_summary IS NOT NULL
+          AND c.analyzer_model != ?
+          AND c.ai_summary != ?
+          AND c.enriched_at IS NULL
+        LIMIT ?
         """
     }
 
@@ -227,6 +268,10 @@ extension RAGStore {
     defer { sqlite3_finalize(statement) }
 
     var bindIndex: Int32 = 1
+    bindText(statement, bindIndex, Self.failedAnalysisModel)
+    bindIndex += 1
+    bindText(statement, bindIndex, Self.failedAnalysisSummary)
+    bindIndex += 1
     if let resolvedRepoId { bindText(statement, bindIndex, resolvedRepoId); bindIndex += 1 }
     sqlite3_bind_int(statement, bindIndex, Int32(limit))
 
@@ -283,10 +328,24 @@ extension RAGStore {
       return try queryInt("""
         SELECT COUNT(*) FROM chunks c
         JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id
-        WHERE c.ai_summary IS NOT NULL AND c.enriched_at IS NULL AND r.id = ?
-        """, bind: { stmt in bindText(stmt, 1, resolvedRepoId) })
+        WHERE c.ai_summary IS NOT NULL
+          AND c.analyzer_model != ?
+          AND c.ai_summary != ?
+          AND c.enriched_at IS NULL
+          AND r.id = ?
+        """, bind: { stmt in
+          bindText(stmt, 1, Self.failedAnalysisModel)
+          bindText(stmt, 2, Self.failedAnalysisSummary)
+          bindText(stmt, 3, resolvedRepoId)
+        })
     }
-    return try queryInt("SELECT COUNT(*) FROM chunks WHERE ai_summary IS NOT NULL AND enriched_at IS NULL")
+    return try queryInt(
+      "SELECT COUNT(*) FROM chunks WHERE ai_summary IS NOT NULL AND analyzer_model != ? AND ai_summary != ? AND enriched_at IS NULL",
+      bind: { stmt in
+        bindText(stmt, 1, Self.failedAnalysisModel)
+        bindText(stmt, 2, Self.failedAnalysisSummary)
+      }
+    )
   }
 
   /// Get count of enriched chunks.
@@ -297,10 +356,23 @@ extension RAGStore {
       return try queryInt("""
         SELECT COUNT(*) FROM chunks c
         JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id
-        WHERE c.enriched_at IS NOT NULL AND r.id = ?
-        """, bind: { stmt in bindText(stmt, 1, resolvedRepoId) })
+        WHERE c.enriched_at IS NOT NULL
+          AND c.analyzer_model != ?
+          AND c.ai_summary != ?
+          AND r.id = ?
+        """, bind: { stmt in
+          bindText(stmt, 1, Self.failedAnalysisModel)
+          bindText(stmt, 2, Self.failedAnalysisSummary)
+          bindText(stmt, 3, resolvedRepoId)
+        })
     }
-    return try queryInt("SELECT COUNT(*) FROM chunks WHERE enriched_at IS NOT NULL")
+    return try queryInt(
+      "SELECT COUNT(*) FROM chunks WHERE enriched_at IS NOT NULL AND analyzer_model != ? AND ai_summary != ?",
+      bind: { stmt in
+        bindText(stmt, 1, Self.failedAnalysisModel)
+        bindText(stmt, 2, Self.failedAnalysisSummary)
+      }
+    )
   }
 
   // MARK: - Code Analytics

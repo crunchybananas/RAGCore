@@ -463,6 +463,7 @@ extension RAGStore {
       let summary = String(cString: summaryPtr)
       let tags = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? "[]"
       let model = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? "unknown"
+      guard summary != "[analysis-failed]", model != "chunk-analyzer-failed" else { continue }
       toCache.append((VectorMath.stableId(for: text), summary, tags, model))
     }
 
