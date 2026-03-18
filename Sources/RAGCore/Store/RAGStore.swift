@@ -773,10 +773,12 @@ public actor RAGStore {
 
       guard let selected else { return nil }
 
-      // 4. Auto-update root_path if it differs (repo moved or synced from another machine)
+      // 4. Auto-update root_path and name if they differ (repo moved/renamed or synced from another machine)
       if selected.path != repoPath {
         let escapedPath = repoPath.replacingOccurrences(of: "'", with: "''")
-        try? exec("UPDATE repos SET root_path = '\(escapedPath)' WHERE id = '\(selected.id)'")
+        let newName = URL(fileURLWithPath: repoPath).lastPathComponent
+        let escapedName = newName.replacingOccurrences(of: "'", with: "''")
+        try? exec("UPDATE repos SET root_path = '\(escapedPath)', name = '\(escapedName)' WHERE id = '\(selected.id)'")
         print("[RAG] Auto-remapped repo \(identifier): \(selected.path) → \(repoPath)")
       }
       return ResolvedRepo(id: selected.id, rootPath: repoPath)
@@ -809,6 +811,51 @@ public actor RAGStore {
   /// - Note: **Deprecated.** The `resolveRepo(for:)` method now transparently resolves
   ///   repos via `repo_identifier` (normalized git remote URL) and auto-updates `root_path`
   ///   on mismatch. Manual remapping should no longer be necessary.
+  /// Reconcile repo names with their current root_path on disk.
+  ///
+  /// When a user moves or renames a repo folder, the `name` column in the repos table
+  /// becomes stale (it was set to the folder name at index time). This method checks each
+  /// repo's `root_path` and updates `name` to match the current folder name if:
+  /// - The root_path exists on disk
+  /// - The current folder name differs from the stored name
+  /// - The repo has no parent (sub-packages keep their package name)
+  ///
+  /// - Returns: Number of repos whose names were updated.
+  @discardableResult
+  public func reconcileRepoNames() throws -> Int {
+    try openIfNeeded()
+    try ensureSchema()
+    guard let db else { return 0 }
+
+    let hasParent = columnExists("repos", column: "parent_repo_id")
+    let sql = hasParent
+      ? "SELECT id, name, root_path FROM repos WHERE parent_repo_id IS NULL"
+      : "SELECT id, name, root_path FROM repos"
+    var stmt: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else { return 0 }
+    defer { sqlite3_finalize(s) }
+
+    var updates: [(id: String, newName: String)] = []
+    while sqlite3_step(s) == SQLITE_ROW {
+      let id = String(cString: sqlite3_column_text(s, 0))
+      let name = String(cString: sqlite3_column_text(s, 1))
+      let rootPath = String(cString: sqlite3_column_text(s, 2))
+
+      let folderName = URL(fileURLWithPath: rootPath).lastPathComponent
+      guard folderName != name,
+            FileManager.default.fileExists(atPath: rootPath) else { continue }
+      updates.append((id: id, newName: folderName))
+    }
+
+    for (id, newName) in updates {
+      let escapedName = newName.replacingOccurrences(of: "'", with: "''")
+      try exec("UPDATE repos SET name = '\(escapedName)' WHERE id = '\(id)'")
+      print("[RAG] Reconciled repo name: \(id) → \(newName)")
+    }
+
+    return updates.count
+  }
+
   @available(*, deprecated, message: "Use resolveRepo(for:) instead — repos are now resolved by repo_identifier automatically.")
   public func remapRepoPath(oldId: String, newPath: String) throws {
     try openIfNeeded()
