@@ -29,6 +29,7 @@ extension RAGStore {
     forceReindex: Bool = false,
     allowWorkspace: Bool = false,
     excludeSubrepos: Bool = true,
+    excludedDirectories: Set<String>? = nil,
     progress: RAGProgressCallback?
   ) async throws -> RAGIndexReport {
     let startTime = Date()
@@ -140,7 +141,8 @@ extension RAGStore {
 
     // Single repo — index normally
     let excludedRoots = (allowWorkspace && excludeSubrepos) ? workspaceRepos : []
-    let scannedFiles = scanner.scan(rootURL: repoURL, excludingRoots: excludedRoots)
+    let effectiveScanner = excludedDirectories.map { RAGFileScanner(excludedDirectories: $0) } ?? scanner
+    let scannedFiles = effectiveScanner.scan(rootURL: repoURL, excludingRoots: excludedRoots)
     logMemory("after scan \(scannedFiles.count) files")
     progress?(.scanning(fileCount: scannedFiles.count))
 
@@ -207,7 +209,7 @@ extension RAGStore {
         }
       }
 
-      guard let file = scanner.loadFile(candidate: candidate) else { continue }
+      guard let file = effectiveScanner.loadFile(candidate: candidate) else { continue }
 
       let relativePath = file.path.hasPrefix(path + "/")
         ? String(file.path.dropFirst(path.count + 1))
