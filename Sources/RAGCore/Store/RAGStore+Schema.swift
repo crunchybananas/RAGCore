@@ -28,6 +28,10 @@ extension RAGStore {
     // WAL mode for better concurrency
     try exec("PRAGMA journal_mode=WAL")
     try exec("PRAGMA busy_timeout=5000")
+    // Disable memory-mapped I/O to prevent SIGBUS crashes on APFS.
+    // During heavy indexing, the WAL-index SHM file can reference pages
+    // beyond EOF, causing "cluster_pagein past EOF" kernel errors.
+    try exec("PRAGMA mmap_size=0")
   }
 
   /// Try to load sqlite-vec extension for accelerated vector search.
