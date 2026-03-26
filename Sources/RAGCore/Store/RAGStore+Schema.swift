@@ -2,7 +2,7 @@
 //  RAGStore+Schema.swift
 //  RAGCore
 //
-//  Schema management and migrations (v1→v16).
+//  Schema management and migrations (v1→v17).
 //
 
 import CSQLite
@@ -418,6 +418,24 @@ extension RAGStore {
     if schemaVersion < 16 {
       backfillRepoEmbeddingModelSync()
       try setSchemaVersion(16)
+    }
+
+    if schemaVersion < 17 {
+      // Fix lessons table for databases created before v9:
+      // The old schema is missing updated_at, apply_count, success_count columns.
+      // ALTER TABLE ADD COLUMN is idempotent-safe — SQLite ignores if column exists
+      // (we catch the error silently).
+      let alterColumns = [
+        "ALTER TABLE lessons ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE lessons ADD COLUMN apply_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE lessons ADD COLUMN success_count INTEGER NOT NULL DEFAULT 0",
+      ]
+      for sql in alterColumns {
+        do { try exec(sql) } catch { /* Column may already exist — safe to ignore */ }
+      }
+      // Backfill updated_at from created_at for existing rows
+      try? exec("UPDATE lessons SET updated_at = created_at WHERE updated_at = ''")
+      try setSchemaVersion(17)
     }
 
     // Set up vec table if extension is loaded
