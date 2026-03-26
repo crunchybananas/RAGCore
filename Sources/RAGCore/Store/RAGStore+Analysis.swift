@@ -108,7 +108,7 @@ extension RAGStore {
           aiSummary: analysis.summary,
           aiTags: tagsJson,
           analyzedAt: now,
-          analyzerModel: "chunk-analyzer"
+          analyzerModel: chunkAnalyzer.analyzerName
         )
         analyzedCount += 1
       } catch {
