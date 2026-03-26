@@ -25,12 +25,16 @@ extension RAGStore {
     }
     db = handle
 
-    // WAL mode for better concurrency
-    try exec("PRAGMA journal_mode=WAL")
+    // DELETE journal mode: avoids WAL SHM mmap which causes SIGBUS on macOS 26 Tahoe.
+    // Files with com.apple.provenance xattr (all files created post Jan-30 on Tahoe)
+    // fail mmap pagein with FS pagein error 22 (EINVAL). The WAL-index SHM file is
+    // always mmap'd in WAL mode regardless of PRAGMA mmap_size, so WAL mode is
+    // fundamentally incompatible with com.apple.provenance on macOS 26.
+    // DELETE mode has slightly lower write throughput but is safe with single-writer
+    // workloads (MLX analysis). Reads no longer require SHM/WAL mmap.
+    try exec("PRAGMA journal_mode=DELETE")
     try exec("PRAGMA busy_timeout=5000")
-    // Disable memory-mapped I/O to prevent SIGBUS crashes on APFS.
-    // During heavy indexing, the WAL-index SHM file can reference pages
-    // beyond EOF, causing "cluster_pagein past EOF" kernel errors.
+    // Disable memory-mapped I/O for the main database file as well.
     try exec("PRAGMA mmap_size=0")
   }
 
