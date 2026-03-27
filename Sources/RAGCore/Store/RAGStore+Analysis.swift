@@ -137,6 +137,7 @@ extension RAGStore {
     analyzedAt: String,
     analyzerModel: String
   ) throws {
+    // Update chunks table (backward compat — still the primary read path)
     let sql = """
       UPDATE chunks SET ai_summary = ?, ai_tags = ?, analyzed_at = ?, analyzer_model = ?, enriched_at = NULL
       WHERE id = ?
@@ -147,6 +148,19 @@ extension RAGStore {
       bindText(stmt, 3, analyzedAt)
       bindText(stmt, 4, analyzerModel)
       bindText(stmt, 5, chunkId)
+    }
+
+    // Also write to chunk_analysis table (multi-model storage #584)
+    let insertAnalysis = """
+      INSERT OR REPLACE INTO chunk_analysis (chunk_id, analyzer_model, ai_summary, ai_tags, analyzed_at, source)
+      VALUES (?, ?, ?, ?, ?, 'local')
+      """
+    try execute(sql: insertAnalysis) { stmt in
+      bindText(stmt, 1, chunkId)
+      bindText(stmt, 2, analyzerModel)
+      bindText(stmt, 3, aiSummary)
+      bindTextOrNull(stmt, 4, aiTags)
+      bindText(stmt, 5, analyzedAt)
     }
 
     guard analyzerModel != Self.failedAnalysisModel, aiSummary != Self.failedAnalysisSummary else {
@@ -710,5 +724,93 @@ extension RAGStore {
       try queryInt("SELECT COUNT(*) FROM embeddings"),
       try queryInt("SELECT COALESCE(SUM(end_line - start_line), 0) FROM chunks")
     )
+  }
+
+  // MARK: - Multi-Model Analysis (#584)
+
+  /// List all analyzer models that have analysis for a given repo.
+  public func availableAnalyzerModels(repoPath: String) throws -> [String] {
+    try openIfNeeded()
+    try ensureSchema()
+    guard let db else { throw RAGError.sqlite("Database not initialized") }
+
+    let repoId = try resolveRepoId(for: repoPath)
+    let sql = """
+      SELECT DISTINCT ca.analyzer_model
+      FROM chunk_analysis ca
+      JOIN chunks c ON ca.chunk_id = c.id
+      JOIN files f ON c.file_id = f.id
+      WHERE f.repo_id = ?
+      ORDER BY ca.analyzer_model
+      """
+    var stmt: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
+    defer { sqlite3_finalize(stmt) }
+    bindText(stmt, 1, repoId)
+
+    var models: [String] = []
+    while sqlite3_step(stmt) == SQLITE_ROW {
+      if let text = sqlite3_column_text(stmt, 0) {
+        models.append(String(cString: text))
+      }
+    }
+    return models
+  }
+
+  /// Count of analysis records per model for a repo.
+  public func analysisCountByModel(repoPath: String) throws -> [(model: String, count: Int)] {
+    try openIfNeeded()
+    try ensureSchema()
+    guard let db else { throw RAGError.sqlite("Database not initialized") }
+
+    let repoId = try resolveRepoId(for: repoPath)
+    let sql = """
+      SELECT ca.analyzer_model, COUNT(*)
+      FROM chunk_analysis ca
+      JOIN chunks c ON ca.chunk_id = c.id
+      JOIN files f ON c.file_id = f.id
+      WHERE f.repo_id = ?
+      GROUP BY ca.analyzer_model
+      ORDER BY COUNT(*) DESC
+      """
+    var stmt: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
+    defer { sqlite3_finalize(stmt) }
+    bindText(stmt, 1, repoId)
+
+    var results: [(model: String, count: Int)] = []
+    while sqlite3_step(stmt) == SQLITE_ROW {
+      if let model = sqlite3_column_text(stmt, 0) {
+        results.append((String(cString: model), Int(sqlite3_column_int(stmt, 1))))
+      }
+    }
+    return results
+  }
+
+  /// Import analysis from an overlay (remote peer) without overwriting local analysis.
+  /// Each model's analysis is stored in its own row — no conflicts.
+  public func importAnalysisFromOverlay(
+    chunkId: String,
+    analyzerModel: String,
+    aiSummary: String,
+    aiTags: String?,
+    analyzedAt: String,
+    source: String
+  ) throws {
+    try openIfNeeded()
+    try ensureSchema()
+
+    let sql = """
+      INSERT OR REPLACE INTO chunk_analysis (chunk_id, analyzer_model, ai_summary, ai_tags, analyzed_at, source)
+      VALUES (?, ?, ?, ?, ?, ?)
+      """
+    try execute(sql: sql) { stmt in
+      bindText(stmt, 1, chunkId)
+      bindText(stmt, 2, analyzerModel)
+      bindText(stmt, 3, aiSummary)
+      bindTextOrNull(stmt, 4, aiTags)
+      bindText(stmt, 5, analyzedAt)
+      bindText(stmt, 6, source)
+    }
   }
 }

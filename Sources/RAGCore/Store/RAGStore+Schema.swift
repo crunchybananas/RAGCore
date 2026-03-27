@@ -438,6 +438,35 @@ extension RAGStore {
       try setSchemaVersion(17)
     }
 
+    if schemaVersion < 18 {
+      // Multi-model analysis: separate table so each model's analysis is preserved (#584).
+      // Switching between local and remote models no longer overwrites analysis.
+      try exec("""
+        CREATE TABLE IF NOT EXISTS chunk_analysis (
+          chunk_id TEXT NOT NULL,
+          analyzer_model TEXT NOT NULL,
+          ai_summary TEXT,
+          ai_tags TEXT,
+          analyzed_at TEXT,
+          enriched_at TEXT,
+          source TEXT DEFAULT 'local',
+          PRIMARY KEY (chunk_id, analyzer_model),
+          FOREIGN KEY (chunk_id) REFERENCES chunks(id)
+        )
+        """)
+      try exec("CREATE INDEX IF NOT EXISTS idx_chunk_analysis_chunk ON chunk_analysis(chunk_id)")
+
+      // Migrate existing analysis from chunks table into chunk_analysis
+      try exec("""
+        INSERT OR IGNORE INTO chunk_analysis (chunk_id, analyzer_model, ai_summary, ai_tags, analyzed_at, enriched_at, source)
+        SELECT id, COALESCE(analyzer_model, 'unknown'), ai_summary, ai_tags, analyzed_at, enriched_at, 'local'
+        FROM chunks
+        WHERE ai_summary IS NOT NULL
+        """)
+
+      try setSchemaVersion(18)
+    }
+
     // Set up vec table if extension is loaded
     if extensionLoaded {
       try ensureVecTable()
