@@ -262,7 +262,11 @@ extension RAGStore {
         repo_identifier = COALESCE(excluded.repo_identifier, repos.repo_identifier),
         parent_repo_id = excluded.parent_repo_id,
         embedding_model = COALESCE(excluded.embedding_model, repos.embedding_model),
-        embedding_dimensions = COALESCE(excluded.embedding_dimensions, repos.embedding_dimensions)
+        embedding_dimensions = CASE
+          WHEN excluded.embedding_dimensions IS NOT NULL AND excluded.embedding_dimensions > 0
+          THEN excluded.embedding_dimensions
+          ELSE COALESCE(repos.embedding_dimensions, excluded.embedding_dimensions)
+        END
       """
     try execute(sql: sql) { stmt in
       bindText(stmt, 1, id)
