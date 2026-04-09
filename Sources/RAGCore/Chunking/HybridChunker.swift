@@ -19,6 +19,7 @@ import Foundation
 public struct HybridChunker: Sendable {
   private let lineChunker = RAGLineChunker()
   private let rubyChunker: RubyChunker?
+  private let glimmerChunker: GlimmerChunker?
   private let jsChunker: JSCoreTypeScriptChunker
 
   /// Path to ast-chunker-cli for Swift subprocess chunking.
@@ -44,6 +45,7 @@ public struct HybridChunker: Sendable {
     var sig = "chunk-v3"
     if astChunkerCLIPath != nil { sig += "+swift" }
     if rubyChunker != nil { sig += "+ruby" }
+    if glimmerChunker != nil { sig += "+glimmer" }
     if jsChunker.isAvailable { sig += "+jscore" }
     return sig
   }
@@ -57,11 +59,13 @@ public struct HybridChunker: Sendable {
     if rubyChunker != nil {
       languages.insert("Ruby")
     }
+    if glimmerChunker != nil || jsChunker.isAvailable {
+      languages.insert("Glimmer TypeScript")
+      languages.insert("Glimmer JavaScript")
+    }
     if jsChunker.isAvailable {
       languages.insert("TypeScript")
       languages.insert("JavaScript")
-      languages.insert("Glimmer TypeScript")
-      languages.insert("Glimmer JavaScript")
     }
     return languages
   }
@@ -74,10 +78,13 @@ public struct HybridChunker: Sendable {
   public init(astChunkerCLIPath: String? = nil, searchPaths: [String] = []) {
     let ruby = RubyChunker()
     self.rubyChunker = ruby.isAvailable ? ruby : nil
+    let glimmer = GlimmerChunker()
+    self.glimmerChunker = glimmer.isAvailable ? glimmer : nil
     self.astChunkerCLIPath = astChunkerCLIPath ?? Self.findASTChunkerCLI(searchPaths: searchPaths)
     self.jsChunker = JSCoreTypeScriptChunker.shared
 
     print("[HybridChunker] Ruby chunker available: \(rubyChunker != nil)")
+    print("[HybridChunker] Glimmer (GTS/GJS) chunker available: \(glimmerChunker != nil)")
     print("[HybridChunker] Swift CLI available: \(self.astChunkerCLIPath != nil) at \(self.astChunkerCLIPath ?? "N/A")")
     print("[HybridChunker] JSCore TS/JS/GTS/GJS chunker available: \(jsChunker.isAvailable)")
     print("[HybridChunker] AST supported languages: \(astSupportedLanguages)")
@@ -149,7 +156,21 @@ public struct HybridChunker: Sendable {
           failureMessage: "File too large: \(byteCount) bytes"
         )
       }
-    case "TypeScript", "JavaScript", "Glimmer TypeScript", "Glimmer JavaScript":
+    case "Glimmer TypeScript", "Glimmer JavaScript":
+      if byteCount > jsMaxBytes {
+        return ChunkingResult(
+          chunks: lineChunker.chunk(text: text),
+          usedAST: false,
+          failureType: .timeout,
+          failureMessage: "File too large: \(byteCount) bytes"
+        )
+      }
+      // Prefer tree-sitter GlimmerChunker for proper construct types; fall back to JSCore
+      if let glimmerChunker {
+        return chunkGlimmerWithTreeSitter(text: text, language: language, filePath: filePath, chunker: glimmerChunker)
+      }
+      return chunkJSWithJSCore(text: text, language: language, filePath: filePath)
+    case "TypeScript", "JavaScript":
       if byteCount > jsMaxBytes {
         return ChunkingResult(
           chunks: lineChunker.chunk(text: text),
@@ -329,6 +350,40 @@ public struct HybridChunker: Sendable {
     }
   }
 
+  // MARK: - Glimmer (GTS/GJS) Tree-sitter Chunking
+
+  private func chunkGlimmerWithTreeSitter(text: String, language: String, filePath: String, chunker: GlimmerChunker) -> ChunkingResult {
+    let fileName = (filePath as NSString).lastPathComponent
+    let astChunks = chunker.chunk(source: text)
+
+    if astChunks.isEmpty {
+      // Fall back to JSCore if tree-sitter produces nothing
+      print("[HybridChunker] Glimmer tree-sitter returned empty for \(fileName), falling back to JSCore")
+      return chunkJSWithJSCore(text: text, language: language, filePath: filePath)
+    }
+
+    let chunks = astChunks.map { chunk in
+      RAGChunk(
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+        text: chunk.text,
+        tokenCount: chunk.estimatedTokenCount,
+        constructType: chunk.constructType.rawValue,
+        constructName: chunk.constructName,
+        metadata: chunk.metadata.toJSON()
+      )
+    }
+
+    print("[HybridChunker] Glimmer tree-sitter: \(chunks.count) chunks for \(fileName)")
+
+    return ChunkingResult(
+      chunks: chunks,
+      usedAST: true,
+      failureType: nil,
+      failureMessage: nil
+    )
+  }
+
   // MARK: - TypeScript/JavaScript JSCore Chunking
 
   private func chunkJSWithJSCore(text: String, language: String, filePath: String) -> ChunkingResult {
@@ -398,8 +453,12 @@ public struct HybridChunker: Sendable {
         return lineChunker.chunk(text: text)
       }
     case "Glimmer TypeScript", "Glimmer JavaScript":
-      let lang = language == "Glimmer TypeScript" ? "gts" : "gjs"
-      astChunks = jsChunker.chunk(source: text, language: lang)
+      if let glimmerChunker {
+        astChunks = glimmerChunker.chunk(source: text)
+      } else {
+        let lang = language == "Glimmer TypeScript" ? "gts" : "gjs"
+        astChunks = jsChunker.chunk(source: text, language: lang)
+      }
     case "TypeScript", "JavaScript":
       astChunks = jsChunker.chunk(source: text, language: language == "TypeScript" ? "ts" : "js")
     default:
