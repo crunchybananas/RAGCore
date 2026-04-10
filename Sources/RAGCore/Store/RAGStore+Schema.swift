@@ -475,13 +475,97 @@ extension RAGStore {
 
   internal func ensureVecTable() throws {
     guard extensionLoaded else { return }
+    guard let db else { return }
     let dims = embeddingProvider.dimensions
+
+    // Check if vec_chunks already exists with a different dimension.
+    // CREATE VIRTUAL TABLE IF NOT EXISTS is a no-op on existing tables,
+    // so a dimension change (e.g. nomic 768d → Qwen3 1024d) would leave
+    // the old table in place, causing every INSERT to fail with a
+    // dimension mismatch error.
+    let tableExistsSql = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='vec_chunks'"
+    let exists = (try? queryInt(tableExistsSql)) ?? 0 > 0
+
+    if exists {
+      // Probe the actual dimension by reading one embedding blob size.
+      // vec0 stores float vectors, so floatCount = blobSize / 4.
+      var probeDims = 0
+      let probeSql = "SELECT embedding FROM vec_chunks LIMIT 1"
+      var stmt: OpaquePointer?
+      if sqlite3_prepare_v2(db, probeSql, -1, &stmt, nil) == SQLITE_OK, let stmt {
+        defer { sqlite3_finalize(stmt) }
+        if sqlite3_step(stmt) == SQLITE_ROW {
+          let blobSize = Int(sqlite3_column_bytes(stmt, 0))
+          probeDims = blobSize / MemoryLayout<Float>.size
+        }
+      }
+
+      if probeDims > 0 && probeDims != dims {
+        print("[RAG] vec_chunks dimension mismatch: table has \(probeDims)d, provider needs \(dims)d — rebuilding")
+        try exec("DROP TABLE vec_chunks")
+        // Fall through to CREATE below
+      } else if probeDims == dims {
+        return // Table exists with correct dimensions
+      }
+      // probeDims == 0 means empty table — recreate to be safe
+      if probeDims == 0 {
+        // Empty table: drop and recreate to guarantee correct dimension declaration
+        try exec("DROP TABLE vec_chunks")
+      }
+    }
+
     try exec("""
       CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0 (
         chunk_id TEXT PRIMARY KEY,
         embedding float[\(dims)]
       )
       """)
+
+    // If we just recreated the table, resync from embeddings blob table.
+    // Only sync embeddings that match the current dimension to avoid
+    // re-inserting stale vectors from a previous model.
+    if exists {
+      let embCount = (try? queryInt("SELECT COUNT(*) FROM embeddings")) ?? 0
+      if embCount > 0 {
+        let expectedBlobSize = dims * MemoryLayout<Float>.size
+        print("[RAG] Resyncing compatible embeddings to new vec_chunks (\(dims)d)")
+        try exec("BEGIN TRANSACTION")
+        do {
+          let sql = "SELECT chunk_id, embedding FROM embeddings WHERE LENGTH(embedding) = ?"
+          var selStmt: OpaquePointer?
+          let result = sqlite3_prepare_v2(db, sql, -1, &selStmt, nil)
+          guard result == SQLITE_OK, let selStmt else {
+            try exec("ROLLBACK")
+            return
+          }
+          defer { sqlite3_finalize(selStmt) }
+          sqlite3_bind_int(selStmt, 1, Int32(expectedBlobSize))
+
+          var synced = 0
+          while sqlite3_step(selStmt) == SQLITE_ROW {
+            let chunkId = String(cString: sqlite3_column_text(selStmt, 0))
+            guard let blob = sqlite3_column_blob(selStmt, 1) else { continue }
+            let blobSize = sqlite3_column_bytes(selStmt, 1)
+
+            let insertSql = "INSERT OR IGNORE INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)"
+            var insertStmt: OpaquePointer?
+            sqlite3_prepare_v2(db, insertSql, -1, &insertStmt, nil)
+            guard let insertStmt else { continue }
+            defer { sqlite3_finalize(insertStmt) }
+
+            sqlite3_bind_text(insertStmt, 1, chunkId, -1, sqliteTransient)
+            sqlite3_bind_blob(insertStmt, 2, blob, blobSize, sqliteTransient)
+            sqlite3_step(insertStmt)
+            synced += 1
+          }
+          try exec("COMMIT")
+          print("[RAG] Resynced \(synced) embeddings to vec_chunks")
+        } catch {
+          try? exec("ROLLBACK")
+          throw error
+        }
+      }
+    }
   }
 
   /// Sync existing embeddings into the vec_chunks table (initial population).
