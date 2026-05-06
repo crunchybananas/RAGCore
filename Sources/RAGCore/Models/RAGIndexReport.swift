@@ -25,6 +25,14 @@ public struct RAGIndexReport: Sendable {
   public let lineFilesChunked: Int
   public let chunkingFailures: Int
 
+  /// Files that were chunked + persisted but skipped vector embedding
+  /// because the embedding provider was unavailable mid-run (e.g. local
+  /// Ollama offline). Those files are searchable via TEXT mode and via
+  /// rag.references / rag.definitions immediately; rerun rag.index once
+  /// the embedder is back to backfill vectors. Defaults to 0 when
+  /// indexing completed normally.
+  public let embeddingSkippedFiles: Int
+
   /// Sub-reports for workspace indexing (one per sub-repo/sub-package).
   public let subReports: [RAGIndexReport]
 
@@ -34,6 +42,7 @@ public struct RAGIndexReport: Sendable {
     chunksIndexed: Int, bytesScanned: Int,
     durationMs: Int, embeddingCount: Int, embeddingDurationMs: Int,
     astFilesChunked: Int, lineFilesChunked: Int, chunkingFailures: Int,
+    embeddingSkippedFiles: Int = 0,
     subReports: [RAGIndexReport] = []
   ) {
     self.repoId = repoId
@@ -49,6 +58,7 @@ public struct RAGIndexReport: Sendable {
     self.astFilesChunked = astFilesChunked
     self.lineFilesChunked = lineFilesChunked
     self.chunkingFailures = chunkingFailures
+    self.embeddingSkippedFiles = embeddingSkippedFiles
     self.subReports = subReports
   }
 }

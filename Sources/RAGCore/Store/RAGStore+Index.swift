@@ -186,6 +186,19 @@ extension RAGStore {
     let embeddingBatchSize = 4
     let memoryCheckInterval = 10
 
+    // Per-run latch: once the embedding provider has failed once with a
+    // transport-style error (Ollama offline, server crashed, network
+    // partition), stop attempting embeddings for the rest of the run.
+    // Files still get chunked, indexed, and symbol-graph-extracted —
+    // they're searchable via TEXT mode and via rag.references /
+    // rag.definitions immediately. Vector embeddings can be backfilled
+    // later by re-running rag.index once the provider is reachable
+    // (incremental indexing re-checks unembedded chunks). This makes
+    // indexing resilient to a flaky local Ollama without spamming logs
+    // with N copies of the same connection error.
+    var embeddingDisabledForRun = false
+    var skippedEmbeddingFiles = 0
+
     // Throttle progress callbacks to avoid flooding the main thread
     // For large repos (2000+ files), per-file callbacks can lock up the UI
     let progressInterval = max(1, scannedFiles.count / 100)  // ~100 updates total
@@ -264,14 +277,31 @@ extension RAGStore {
         }
       }
 
-      if !missingEmbeddings.isEmpty {
+      if !missingEmbeddings.isEmpty && !embeddingDisabledForRun {
         let embedStart = Date()
+        var aborted = false
 
-        for batchStart in stride(from: 0, to: missingEmbeddings.count, by: embeddingBatchSize) {
+        batchLoop: for batchStart in stride(from: 0, to: missingEmbeddings.count, by: embeddingBatchSize) {
           let batchEnd = min(batchStart + embeddingBatchSize, missingEmbeddings.count)
           let batchTexts = missingEmbeddings[batchStart..<batchEnd].map(\.text)
 
-          let batchEmbeddings = try await embeddingProvider.embed(texts: batchTexts)
+          let batchEmbeddings: [[Float]]
+          do {
+            batchEmbeddings = try await embeddingProvider.embed(texts: batchTexts)
+          } catch {
+            // Likely transport (Ollama offline) or rate-limit. Latch
+            // embeddings off for the rest of the run, log once, and let
+            // the caller see chunks/symbols still get persisted. The
+            // alternative — propagating — turns a transient embedder
+            // outage into "every file in the repo failed to index",
+            // which is what previously made `rag.index` unusable when
+            // Ollama wasn't reachable.
+            print("[RAG] Embedding disabled for the rest of this run: \(error.localizedDescription). Files will still be chunked + indexed; rerun rag.index once the embedder is reachable to backfill vectors.")
+            embeddingDisabledForRun = true
+            skippedEmbeddingFiles += 1
+            aborted = true
+            break batchLoop
+          }
           embeddingCount += batchEmbeddings.count
 
           for (offset, vector) in batchEmbeddings.enumerated() {
@@ -299,6 +329,15 @@ extension RAGStore {
         let embedDuration = Int(Date().timeIntervalSince(embedStart) * 1000)
         embeddingDurationMs += embedDuration
         embeddingCache.removeAll(keepingCapacity: false)
+        // If we aborted partway through, the embeddingCache holds what
+        // succeeded before the failure — those chunks will store with
+        // vectors. Subsequent files in this run skip embedding entirely.
+        _ = aborted
+      } else if !missingEmbeddings.isEmpty {
+        // Embeddings already disabled for the run (an earlier file's
+        // embed threw). Track the count so the report can surface how
+        // many files we skipped vector embedding for.
+        skippedEmbeddingFiles += 1
       }
 
       if filesIndexed % progressInterval == 0 {
@@ -406,7 +445,8 @@ extension RAGStore {
       embeddingDurationMs: embeddingDurationMs,
       astFilesChunked: astFilesChunked,
       lineFilesChunked: lineFilesChunked,
-      chunkingFailures: chunkingFailures
+      chunkingFailures: chunkingFailures,
+      embeddingSkippedFiles: skippedEmbeddingFiles
     )
     progress?(.complete(report: report))
     return report
