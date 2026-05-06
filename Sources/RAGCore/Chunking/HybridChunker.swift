@@ -25,8 +25,13 @@ public struct HybridChunker: Sendable {
   /// Path to ast-chunker-cli for Swift subprocess chunking.
   private let astChunkerCLIPath: String?
 
-  /// Subprocess timeout for Swift AST parsing.
-  private let swiftSubprocessTimeout: TimeInterval = 5.0
+  /// Subprocess timeout for Swift AST parsing. 15s is comfortably above
+  /// SwiftSyntax's parse cost on the largest files we've measured (~50KB
+  /// SwiftUI views typically finish in <1s, but a contended indexer + cold
+  /// JIT under heavy load can creep up). Files that consistently exceed
+  /// this fall back to line chunking and get tracked by
+  /// ChunkingHealthTracker for diagnostics.
+  private let swiftSubprocessTimeout: TimeInterval = 15.0
 
   /// Max file size for Swift subprocess (very large files still timeout).
   private let swiftSubprocessMaxBytes = 500_000  // 500KB
@@ -270,6 +275,7 @@ public struct HybridChunker: Sendable {
       group.leave()
     }
 
+    let startedAt = Date()
     do {
       try process.run()
 
@@ -277,12 +283,13 @@ public struct HybridChunker: Sendable {
       if result == .timedOut {
         process.terminate()
         let fileName = (filePath as NSString).lastPathComponent
-        print("[HybridChunker] Swift CLI timeout for \(fileName)")
+        let bytes = text.utf8.count
+        print("[HybridChunker] Swift CLI timeout for \(fileName) after \(swiftSubprocessTimeout)s (\(bytes) bytes)")
         return ChunkingResult(
           chunks: lineChunker.chunk(text: text),
           usedAST: false,
           failureType: .timeout,
-          failureMessage: "Subprocess timeout"
+          failureMessage: "Subprocess timeout after \(Int(swiftSubprocessTimeout))s (\(bytes) bytes)"
         )
       }
 
@@ -308,7 +315,14 @@ public struct HybridChunker: Sendable {
 
       let fileName = (filePath as NSString).lastPathComponent
       let chunksWithMeta = cliChunks.filter { $0.metadata != nil }.count
-      print("[HybridChunker] Swift CLI for \(fileName): \(cliChunks.count) chunks, \(chunksWithMeta) with metadata")
+      let elapsed = Date().timeIntervalSince(startedAt)
+      // Log slow successes — useful for spotting files creeping toward the
+      // timeout before they actually fail.
+      if elapsed > swiftSubprocessTimeout / 3 {
+        print("[HybridChunker] Swift CLI for \(fileName): \(cliChunks.count) chunks, \(chunksWithMeta) with metadata (\(String(format: "%.2f", elapsed))s)")
+      } else {
+        print("[HybridChunker] Swift CLI for \(fileName): \(cliChunks.count) chunks, \(chunksWithMeta) with metadata")
+      }
 
       if cliChunks.isEmpty {
         return ChunkingResult(

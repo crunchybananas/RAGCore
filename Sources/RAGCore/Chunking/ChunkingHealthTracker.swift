@@ -67,8 +67,30 @@ public struct ChunkingHealthTracker: Sendable {
   }
 
   /// Check if AST chunking should be skipped for a file based on previous failures.
+  ///
+  /// Skips ONLY for failures we don't expect to resolve on retry — parse
+  /// errors, crashes, stack overflows. `.timeout` failures are NOT
+  /// considered terminal: they often reflect transient indexer load, and
+  /// re-trying them gives the system a chance to recover (e.g. after a
+  /// timeout-budget bump or a quieter machine). The success path then
+  /// purges the failure record via `recordSuccess`.
   public func shouldSkipAST(for filePath: String, hash: String) -> Bool {
-    failures.contains { $0.filePath == filePath && $0.fileHash == hash }
+    failures.contains { record in
+      record.filePath == filePath
+        && record.fileHash == hash
+        && record.errorType != .timeout
+    }
+  }
+
+  /// Purge a previously-recorded failure for a file that just succeeded.
+  /// Pair with the success path of the chunker so a one-off timeout
+  /// doesn't shadow the AST result on every subsequent re-index.
+  public mutating func recordSuccess(filePath: String) {
+    let before = failures.count
+    failures.removeAll { $0.filePath == filePath }
+    if failures.count != before {
+      saveFailures()
+    }
   }
 
   /// Record a chunking failure.

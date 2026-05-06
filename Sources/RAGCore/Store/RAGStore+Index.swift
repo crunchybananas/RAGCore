@@ -260,6 +260,10 @@ extension RAGStore {
           errorMessage: chunkResult.failureMessage,
           fileHash: fileHash
         )
+      } else if chunkResult.usedAST {
+        // AST chunking succeeded — clear any stale failure record so a
+        // one-off timeout doesn't keep us on the line-chunked path forever.
+        healthTracker.recordSuccess(filePath: relativePath)
       }
 
       let chunks = chunkResult.chunks
