@@ -325,6 +325,7 @@ extension RAGStore {
       try deleteChunks(for: fileId)
       try deleteDependencies(for: fileId)
       try deleteSymbolRefs(for: fileId)
+      try deleteSymbols(for: fileId)
 
       for (index, chunk) in chunks.enumerated() {
         let chunkId = VectorMath.stableId(for: "\(fileId):\(chunk.startLine):\(chunk.endLine):\(chunk.text)")
@@ -365,6 +366,11 @@ extension RAGStore {
         from: chunks, repoId: repoId, fileId: fileId
       )
       if !symbolRefs.isEmpty { try insertSymbolRefs(symbolRefs) }
+
+      let symbolDefs = extractSymbolDefinitions(
+        from: chunks, repoId: repoId, fileId: fileId
+      )
+      if !symbolDefs.isEmpty { try insertSymbols(symbolDefs) }
 
       chunkCount += chunks.count
       bytesScanned += file.byteCount
@@ -448,9 +454,10 @@ extension RAGStore {
           bindText(stmt, 1, staleFile.id)
         }
       }
-      // Delete dependencies and symbol refs
+      // Delete dependencies and symbol refs/defs
       try deleteDependencies(for: staleFile.id)
       try deleteSymbolRefs(for: staleFile.id)
+      try deleteSymbols(for: staleFile.id)
       // Delete the file row — chunks and embeddings cascade
       let delSql = "DELETE FROM files WHERE id = ?"
       try execute(sql: delSql) { stmt in
