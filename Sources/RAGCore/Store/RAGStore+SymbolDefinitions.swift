@@ -159,10 +159,16 @@ extension RAGStore {
   /// Find every symbol definition matching `name`, optionally scoped to
   /// one repo. Companion to `findSymbolReferences` — together they answer
   /// "where is X defined?" and "who references X?" with the same shape.
+  ///
+  /// `language` (case-insensitive) scopes results to one source language
+  /// — useful when the same symbol name appears across stacks (Ember
+  /// `Component` vs. Swift `Component`). Pass `nil` (default) to match
+  /// every language.
   public func findSymbolDefinitions(
     name: String,
     repoPath: String? = nil,
-    limit: Int = 100
+    limit: Int = 100,
+    language: String? = nil
   ) throws -> [RAGSymbolDefinitionResult] {
     try openIfNeeded()
     guard let db else { throw RAGError.sqlite("Database not initialized") }
@@ -186,6 +192,9 @@ extension RAGStore {
     if scopedRepoId != nil {
       sql += " AND s.repo_id = ?"
     }
+    if language != nil {
+      sql += " AND LOWER(f.language) = LOWER(?)"
+    }
     sql += " ORDER BY r.name, f.path, s.start_line LIMIT ?"
 
     var stmt: OpaquePointer?
@@ -200,6 +209,9 @@ extension RAGStore {
     bindText(stmt, bindIdx, name); bindIdx += 1
     if let scopedRepoId {
       bindText(stmt, bindIdx, scopedRepoId); bindIdx += 1
+    }
+    if let language {
+      bindText(stmt, bindIdx, language); bindIdx += 1
     }
     sqlite3_bind_int(stmt, bindIdx, Int32(limit))
 
@@ -233,7 +245,8 @@ extension RAGStore {
   /// + reference count pair before paging the full results.
   public func countSymbolDefinitions(
     name: String,
-    repoPath: String? = nil
+    repoPath: String? = nil,
+    language: String? = nil
   ) throws -> Int {
     try openIfNeeded()
     guard let db else { throw RAGError.sqlite("Database not initialized") }
@@ -246,9 +259,19 @@ extension RAGStore {
       scopedRepoId = nil
     }
 
-    var sql = "SELECT COUNT(*) FROM symbols WHERE name = ?"
-    if scopedRepoId != nil {
-      sql += " AND repo_id = ?"
+    var sql: String
+    if language == nil {
+      sql = "SELECT COUNT(*) FROM symbols WHERE name = ?"
+      if scopedRepoId != nil { sql += " AND repo_id = ?" }
+    } else {
+      sql = """
+        SELECT COUNT(*)
+        FROM symbols s
+        JOIN files f ON f.id = s.file_id
+        WHERE s.name = ?
+        """
+      if scopedRepoId != nil { sql += " AND s.repo_id = ?" }
+      sql += " AND LOWER(f.language) = LOWER(?)"
     }
 
     var stmt: OpaquePointer?
@@ -258,7 +281,10 @@ extension RAGStore {
     var bindIdx: Int32 = 1
     bindText(stmt, bindIdx, name); bindIdx += 1
     if let scopedRepoId {
-      bindText(stmt, bindIdx, scopedRepoId)
+      bindText(stmt, bindIdx, scopedRepoId); bindIdx += 1
+    }
+    if let language {
+      bindText(stmt, bindIdx, language)
     }
 
     if sqlite3_step(stmt) == SQLITE_ROW {

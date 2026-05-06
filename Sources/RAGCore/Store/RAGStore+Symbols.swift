@@ -83,13 +83,20 @@ extension RAGStore {
   ///     questions (e.g. "who CONFORMS to this protocol?") should pass
   ///     the matching kind to avoid drowning in plain type-usage hits.
   ///     Pass `nil` (default) to match every kind.
+  ///   - language: Optional source-language filter (case-insensitive
+  ///     match against the chunker's `f.language` column, e.g. `"Swift"`,
+  ///     `"Ruby"`, `"TypeScript"`). Useful when the same symbol name
+  ///     appears across stacks — Ember `Component` references shouldn't
+  ///     drown out Swift `Component` references during a Swift refactor.
+  ///     Pass `nil` (default) to match every language.
   /// - Returns: Reference rows ordered by repo name then file path so
   ///   results within the same repo group naturally.
   public func findSymbolReferences(
     name: String,
     repoPath: String? = nil,
     limit: Int = 100,
-    refKind: String? = nil
+    refKind: String? = nil,
+    language: String? = nil
   ) throws -> [RAGSymbolReferenceResult] {
     try openIfNeeded()
     guard let db else { throw RAGError.sqlite("Database not initialized") }
@@ -118,6 +125,11 @@ extension RAGStore {
     if refKind != nil {
       sql += " AND sr.ref_kind = ?"
     }
+    if language != nil {
+      // Case-insensitive match — chunker stores "Swift", but callers
+      // passing "swift" shouldn't get an empty result for that.
+      sql += " AND LOWER(f.language) = LOWER(?)"
+    }
     sql += " ORDER BY r.name, f.path LIMIT ?"
 
     var stmt: OpaquePointer?
@@ -135,6 +147,9 @@ extension RAGStore {
     }
     if let refKind {
       bindText(stmt, bindIdx, refKind); bindIdx += 1
+    }
+    if let language {
+      bindText(stmt, bindIdx, language); bindIdx += 1
     }
     sqlite3_bind_int(stmt, bindIdx, Int32(limit))
 
@@ -172,7 +187,8 @@ extension RAGStore {
   public func countSymbolReferences(
     name: String,
     repoPath: String? = nil,
-    refKind: String? = nil
+    refKind: String? = nil,
+    language: String? = nil
   ) throws -> Int {
     try openIfNeeded()
     guard let db else { throw RAGError.sqlite("Database not initialized") }
@@ -185,12 +201,24 @@ extension RAGStore {
       scopedRepoId = nil
     }
 
-    var sql = "SELECT COUNT(*) FROM symbol_refs WHERE referenced_name = ?"
-    if scopedRepoId != nil {
-      sql += " AND repo_id = ?"
-    }
-    if refKind != nil {
-      sql += " AND ref_kind = ?"
+    // Language filter forces a join to files since symbol_refs has no
+    // language column of its own. Without it we keep the simple form
+    // for the unfiltered fast path.
+    var sql: String
+    if language == nil {
+      sql = "SELECT COUNT(*) FROM symbol_refs WHERE referenced_name = ?"
+      if scopedRepoId != nil { sql += " AND repo_id = ?" }
+      if refKind != nil { sql += " AND ref_kind = ?" }
+    } else {
+      sql = """
+        SELECT COUNT(*)
+        FROM symbol_refs sr
+        JOIN files f ON f.id = sr.source_file_id
+        WHERE sr.referenced_name = ?
+        """
+      if scopedRepoId != nil { sql += " AND sr.repo_id = ?" }
+      if refKind != nil { sql += " AND sr.ref_kind = ?" }
+      sql += " AND LOWER(f.language) = LOWER(?)"
     }
 
     var stmt: OpaquePointer?
@@ -203,7 +231,10 @@ extension RAGStore {
       bindText(stmt, bindIdx, scopedRepoId); bindIdx += 1
     }
     if let refKind {
-      bindText(stmt, bindIdx, refKind)
+      bindText(stmt, bindIdx, refKind); bindIdx += 1
+    }
+    if let language {
+      bindText(stmt, bindIdx, language)
     }
 
     if sqlite3_step(stmt) == SQLITE_ROW {
