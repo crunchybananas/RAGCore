@@ -76,12 +76,20 @@ extension RAGStore {
   ///   - limit: Hard cap on rows returned. Defaults to 100; popular type
   ///     names (e.g. "Component", "Application") commonly have hundreds
   ///     of hits across a swarm.
+  ///   - refKind: Optional filter on the chunker's reference kind. The
+  ///     chunker emits `"type"` for general type usage, `"conform"` for
+  ///     protocol conformances, `"inherit"` for class inheritance, and
+  ///     `"mixin"` for include/extend/prepend. Callers asking refactor
+  ///     questions (e.g. "who CONFORMS to this protocol?") should pass
+  ///     the matching kind to avoid drowning in plain type-usage hits.
+  ///     Pass `nil` (default) to match every kind.
   /// - Returns: Reference rows ordered by repo name then file path so
   ///   results within the same repo group naturally.
   public func findSymbolReferences(
     name: String,
     repoPath: String? = nil,
-    limit: Int = 100
+    limit: Int = 100,
+    refKind: String? = nil
   ) throws -> [RAGSymbolReferenceResult] {
     try openIfNeeded()
     guard let db else { throw RAGError.sqlite("Database not initialized") }
@@ -107,6 +115,9 @@ extension RAGStore {
     if scopedRepoId != nil {
       sql += " AND sr.repo_id = ?"
     }
+    if refKind != nil {
+      sql += " AND sr.ref_kind = ?"
+    }
     sql += " ORDER BY r.name, f.path LIMIT ?"
 
     var stmt: OpaquePointer?
@@ -122,6 +133,9 @@ extension RAGStore {
     if let scopedRepoId {
       bindText(stmt, bindIdx, scopedRepoId); bindIdx += 1
     }
+    if let refKind {
+      bindText(stmt, bindIdx, refKind); bindIdx += 1
+    }
     sqlite3_bind_int(stmt, bindIdx, Int32(limit))
 
     var results: [RAGSymbolReferenceResult] = []
@@ -131,7 +145,7 @@ extension RAGStore {
       let rootPath = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? ""
       let relPath = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? ""
       let language = sqlite3_column_text(stmt, 4).map { String(cString: $0) }
-      let refKind = sqlite3_column_text(stmt, 5).map { String(cString: $0) } ?? "type"
+      let kind = sqlite3_column_text(stmt, 5).map { String(cString: $0) } ?? "type"
 
       results.append(RAGSymbolReferenceResult(
         repoIdentifier: repoIdentifier,
@@ -139,7 +153,7 @@ extension RAGStore {
         repoRootPath: rootPath,
         relativePath: relPath,
         language: language,
-        refKind: refKind
+        refKind: kind
       ))
     }
     return results
@@ -150,9 +164,15 @@ extension RAGStore {
   /// Useful when callers want to gauge popularity before paging — e.g.
   /// "Component" might have 152 hits; a caller can show that first, then
   /// let the user narrow the search by passing a `repoPath`.
+  ///
+  /// `refKind` accepts the same values as `findSymbolReferences`. When
+  /// supplied, the count reflects only that subset — useful when a
+  /// caller wants "how many implementers does protocol X have?"
+  /// without paging the full result set.
   public func countSymbolReferences(
     name: String,
-    repoPath: String? = nil
+    repoPath: String? = nil,
+    refKind: String? = nil
   ) throws -> Int {
     try openIfNeeded()
     guard let db else { throw RAGError.sqlite("Database not initialized") }
@@ -169,6 +189,9 @@ extension RAGStore {
     if scopedRepoId != nil {
       sql += " AND repo_id = ?"
     }
+    if refKind != nil {
+      sql += " AND ref_kind = ?"
+    }
 
     var stmt: OpaquePointer?
     guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return 0 }
@@ -177,7 +200,10 @@ extension RAGStore {
     var bindIdx: Int32 = 1
     bindText(stmt, bindIdx, name); bindIdx += 1
     if let scopedRepoId {
-      bindText(stmt, bindIdx, scopedRepoId)
+      bindText(stmt, bindIdx, scopedRepoId); bindIdx += 1
+    }
+    if let refKind {
+      bindText(stmt, bindIdx, refKind)
     }
 
     if sqlite3_step(stmt) == SQLITE_ROW {
