@@ -61,8 +61,22 @@ extension RAGStore {
       // canonical form the caller would search for.
       let name = rawName
 
-      let kind = (chunk.constructType?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+      // Normalize the chunker's construct types so the definitional
+      // filter accepts both "class" and "classDecl", "protocol" and
+      // "protocolDecl", etc. The Swift AST chunker emits the -Decl
+      // suffixed forms (`classDecl`, `protocolDecl`, `structDecl`,
+      // `enumDecl`, `actorDecl`, `extensionDecl`); without
+      // normalization, all 1100+ Swift type definitions in a peel
+      // reindex were silently dropped from the symbols table.
+      let rawKind = (chunk.constructType?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
         ?? "unknown"
+      let kind: String
+      if rawKind.hasSuffix("decl") {
+        kind = String(rawKind.dropLast(4))
+      } else {
+        kind = rawKind
+      }
+
       // Filter out non-definitional chunk kinds — comments, imports,
       // and "block" chunks are not symbols and would only add noise to
       // the index. Definition-bearing kinds are AST constructs that
