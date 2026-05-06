@@ -58,6 +58,25 @@ public struct RAGCoverageReport: Sendable {
   /// are not counted as gaps — only indexable files that should be
   /// there.
   public let missingSample: [RAGUnindexedFile]
+  /// Directories with the largest disk-vs-indexed gaps. Surfaces
+  /// patterns like "all files under Local Packages/InferenceRouting are
+  /// missing" without making the caller correlate across the
+  /// missingSample. Capped to the top 20 by gap size.
+  public let topGapDirectories: [DirectoryGap]
+
+  public struct DirectoryGap: Sendable {
+    /// Repo-relative directory (e.g. "Local Packages/InferenceRouting").
+    public let directory: String
+    public let onDisk: Int
+    public let indexed: Int
+    public var gap: Int { max(0, onDisk - indexed) }
+
+    public init(directory: String, onDisk: Int, indexed: Int) {
+      self.directory = directory
+      self.onDisk = onDisk
+      self.indexed = indexed
+    }
+  }
 
   public init(
     repoIdentifier: String,
@@ -65,7 +84,8 @@ public struct RAGCoverageReport: Sendable {
     totalOnDisk: Int,
     totalIndexed: Int,
     byLanguage: [LanguageCoverage],
-    missingSample: [RAGUnindexedFile]
+    missingSample: [RAGUnindexedFile],
+    topGapDirectories: [DirectoryGap] = []
   ) {
     self.repoIdentifier = repoIdentifier
     self.repoName = repoName
@@ -73,6 +93,7 @@ public struct RAGCoverageReport: Sendable {
     self.totalIndexed = totalIndexed
     self.byLanguage = byLanguage
     self.missingSample = missingSample
+    self.topGapDirectories = topGapDirectories
   }
 }
 
@@ -180,13 +201,58 @@ extension RAGStore {
       return $0.relativePath < $1.relativePath
     }
 
+    // Per-directory rollup: surfaces patterns like "all files in
+    // Local Packages/InferenceRouting are missing" without forcing the
+    // caller to correlate across the (sample-capped) missing list.
+    // Bucket at depth 2 — `<root>/<sub>` — which is the granularity
+    // operators usually think in (a package, a feature folder).
+    var diskByDir: [String: Int] = [:]
+    for rel in diskAll.keys {
+      let bucket = directoryBucket(for: rel, depth: 2)
+      diskByDir[bucket, default: 0] += 1
+    }
+    var indexedByDir: [String: Int] = [:]
+    for rel in indexedPaths {
+      let bucket = directoryBucket(for: rel, depth: 2)
+      indexedByDir[bucket, default: 0] += 1
+    }
+    let topGaps: [RAGCoverageReport.DirectoryGap] = Set(diskByDir.keys)
+      .union(indexedByDir.keys)
+      .map { dir in
+        RAGCoverageReport.DirectoryGap(
+          directory: dir,
+          onDisk: diskByDir[dir] ?? 0,
+          indexed: indexedByDir[dir] ?? 0
+        )
+      }
+      .filter { $0.gap > 0 }
+      .sorted { lhs, rhs in
+        if lhs.gap != rhs.gap { return lhs.gap > rhs.gap }
+        return lhs.directory < rhs.directory
+      }
+      .prefix(20)
+      .map { $0 }
+
     return RAGCoverageReport(
       repoIdentifier: repoIdentifier,
       repoName: repoName,
       totalOnDisk: candidates.count,
       totalIndexed: indexedPaths.count,
       byLanguage: byLanguage,
-      missingSample: missing
+      missingSample: missing,
+      topGapDirectories: topGaps
     )
+  }
+
+  /// Bucket a relative path by its first `depth` components.
+  /// `Local Packages/InferenceRouting/Sources/X.swift` at depth 2 →
+  /// `Local Packages/InferenceRouting`. Single-component paths bucket
+  /// to themselves so root-level files don't collapse into "".
+  private nonisolated func directoryBucket(for relativePath: String, depth: Int) -> String {
+    let parts = relativePath.split(separator: "/", omittingEmptySubsequences: true)
+    guard parts.count > 1 else { return "(root)" }
+    let take = min(depth, parts.count - 1)
+    guard take > 0 else { return "(root)" }
+    return parts.prefix(take).joined(separator: "/")
   }
 }
