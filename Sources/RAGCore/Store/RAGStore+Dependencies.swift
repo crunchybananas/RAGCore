@@ -172,7 +172,13 @@ extension RAGStore {
     fileId: String
   ) -> [SymbolRef] {
     var refs: [SymbolRef] = []
-    var seenNames = Set<String>()
+    // Dedup per (name, kind). Earlier code used a global Set<String>
+    // shared across kinds, which silently dropped conform/inherit/mixin
+    // entries for any symbol that also appeared as a typeReference in
+    // the same file — which is essentially every protocol you also
+    // mention in the file's body (Sendable, Codable, View, …).
+    var seen = Set<String>()
+    func key(_ kind: String, _ name: String) -> String { "\(kind):\(name)" }
 
     for chunk in chunks {
       guard let metadataJson = chunk.metadata,
@@ -182,39 +188,45 @@ extension RAGStore {
       }
 
       for typeName in metadata.typeReferences {
-        guard !seenNames.contains(typeName) else { continue }
-        seenNames.insert(typeName)
+        let k = key("type", typeName)
+        guard !seen.contains(k) else { continue }
+        seen.insert(k)
         refs.append(SymbolRef(
-          id: VectorMath.stableId(for: "\(fileId):\(typeName)"),
+          id: VectorMath.stableId(for: "\(fileId):type:\(typeName)"),
           repoId: repoId, sourceFileId: fileId,
           referencedName: typeName, refKind: "type"
         ))
       }
 
       for proto in metadata.protocols {
-        guard !seenNames.contains(proto) else { continue }
-        seenNames.insert(proto)
+        let k = key("conform", proto)
+        guard !seen.contains(k) else { continue }
+        seen.insert(k)
         refs.append(SymbolRef(
-          id: VectorMath.stableId(for: "\(fileId):\(proto)"),
+          id: VectorMath.stableId(for: "\(fileId):conform:\(proto)"),
           repoId: repoId, sourceFileId: fileId,
           referencedName: proto, refKind: "conform"
         ))
       }
 
-      if let superclass = metadata.superclass, !seenNames.contains(superclass) {
-        seenNames.insert(superclass)
-        refs.append(SymbolRef(
-          id: VectorMath.stableId(for: "\(fileId):\(superclass)"),
-          repoId: repoId, sourceFileId: fileId,
-          referencedName: superclass, refKind: "inherit"
-        ))
+      if let superclass = metadata.superclass {
+        let k = key("inherit", superclass)
+        if !seen.contains(k) {
+          seen.insert(k)
+          refs.append(SymbolRef(
+            id: VectorMath.stableId(for: "\(fileId):inherit:\(superclass)"),
+            repoId: repoId, sourceFileId: fileId,
+            referencedName: superclass, refKind: "inherit"
+          ))
+        }
       }
 
       for mixin in metadata.mixins {
-        guard !seenNames.contains(mixin) else { continue }
-        seenNames.insert(mixin)
+        let k = key("mixin", mixin)
+        guard !seen.contains(k) else { continue }
+        seen.insert(k)
         refs.append(SymbolRef(
-          id: VectorMath.stableId(for: "\(fileId):\(mixin)"),
+          id: VectorMath.stableId(for: "\(fileId):mixin:\(mixin)"),
           repoId: repoId, sourceFileId: fileId,
           referencedName: mixin, refKind: "mixin"
         ))
