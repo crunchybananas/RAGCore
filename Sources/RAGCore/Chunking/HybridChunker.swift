@@ -21,6 +21,8 @@ public struct HybridChunker: Sendable {
   private let rubyChunker: RubyChunker?
   private let glimmerChunker: GlimmerChunker?
   private let jsChunker: JSCoreTypeScriptChunker
+  /// Plain .hbs templates (cloke/peel#749). Pure Swift — always available.
+  private let handlebarsChunker = HandlebarsChunker()
 
   /// Path to ast-chunker-cli for Swift subprocess chunking.
   private let astChunkerCLIPath: String?
@@ -47,7 +49,10 @@ public struct HybridChunker: Sendable {
   /// chunker availability changes (e.g., JSCore becomes available).
   /// Bump the base version when chunking logic changes materially.
   public var chunkingSignature: String {
-    var sig = "chunk-v3"
+    // "+hbs" is unconditional (HandlebarsChunker is pure Swift) — its
+    // presence in the signature is what forces already-indexed .hbs files
+    // (and stale pre-iter-6 Swift metadata) to re-chunk on the next pass.
+    var sig = "chunk-v3+hbs"
     if astChunkerCLIPath != nil { sig += "+swift" }
     if rubyChunker != nil { sig += "+ruby" }
     if glimmerChunker != nil { sig += "+glimmer" }
@@ -72,6 +77,7 @@ public struct HybridChunker: Sendable {
       languages.insert("TypeScript")
       languages.insert("JavaScript")
     }
+    languages.insert("Handlebars")
     return languages
   }
 
@@ -92,6 +98,7 @@ public struct HybridChunker: Sendable {
     print("[HybridChunker] Glimmer (GTS/GJS) chunker available: \(glimmerChunker != nil)")
     print("[HybridChunker] Swift CLI available: \(self.astChunkerCLIPath != nil) at \(self.astChunkerCLIPath ?? "N/A")")
     print("[HybridChunker] JSCore TS/JS/GTS/GJS chunker available: \(jsChunker.isAvailable)")
+    print("[HybridChunker] Handlebars (.hbs) chunker available: true")
     print("[HybridChunker] AST supported languages: \(astSupportedLanguages)")
     print("[HybridChunker] Chunking signature: \(chunkingSignature)")
   }
@@ -185,6 +192,16 @@ public struct HybridChunker: Sendable {
         )
       }
       return chunkJSWithJSCore(text: text, language: language, filePath: filePath)
+    case "Handlebars":
+      if byteCount > treeSitterMaxBytes {
+        return ChunkingResult(
+          chunks: lineChunker.chunk(text: text),
+          usedAST: false,
+          failureType: .timeout,
+          failureMessage: "File too large: \(byteCount) bytes"
+        )
+      }
+      return chunkHandlebars(text: text, filePath: filePath)
     default:
       break
     }
@@ -398,6 +415,43 @@ public struct HybridChunker: Sendable {
     )
   }
 
+  // MARK: - Handlebars (.hbs) Chunking
+
+  private func chunkHandlebars(text: String, filePath: String) -> ChunkingResult {
+    let fileName = (filePath as NSString).lastPathComponent
+    let astChunks = handlebarsChunker.chunk(source: text, maxChunkLines: 150)
+
+    if astChunks.isEmpty {
+      return ChunkingResult(
+        chunks: lineChunker.chunk(text: text),
+        usedAST: false,
+        failureType: .parseError,
+        failureMessage: "Handlebars chunker returned empty"
+      )
+    }
+
+    let chunks = astChunks.map { chunk in
+      RAGChunk(
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+        text: chunk.text,
+        tokenCount: chunk.estimatedTokenCount,
+        constructType: chunk.constructType.rawValue,
+        constructName: chunk.constructName,
+        metadata: chunk.metadata.toJSON()
+      )
+    }
+
+    print("[HybridChunker] Handlebars: \(chunks.count) chunks for \(fileName)")
+
+    return ChunkingResult(
+      chunks: chunks,
+      usedAST: true,
+      failureType: nil,
+      failureMessage: nil
+    )
+  }
+
   // MARK: - TypeScript/JavaScript JSCore Chunking
 
   private func chunkJSWithJSCore(text: String, language: String, filePath: String) -> ChunkingResult {
@@ -475,6 +529,8 @@ public struct HybridChunker: Sendable {
       }
     case "TypeScript", "JavaScript":
       astChunks = jsChunker.chunk(source: text, language: language == "TypeScript" ? "ts" : "js")
+    case "Handlebars":
+      astChunks = handlebarsChunker.chunk(source: text, maxChunkLines: 150)
     default:
       return lineChunker.chunk(text: text)
     }
