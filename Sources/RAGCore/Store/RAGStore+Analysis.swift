@@ -401,22 +401,35 @@ extension RAGStore {
     guard let db else { throw RAGError.sqlite("Database not initialized") }
     let resolvedRepoId: String? = if let repoPath { try resolveRepoId(for: repoPath) } else { nil }
 
+    // Two-level aggregation so each group carries its file paths + per-file
+    // token sums (the flat GROUP BY couldn't — `files` always came back
+    // empty, cloke/peel#774): inner query collapses chunks to one row per
+    // (construct, file), outer groups files into constructs and packs the
+    // file list with GROUP_CONCAT (char(31) unit separator between path and
+    // tokens, char(10) between files — neither appears in paths).
     var sql = """
-      SELECT c.construct_name, c.construct_type,
-             COUNT(DISTINCT f.id) as file_count,
-             SUM(c.token_count) as total_tokens,
-             c.ai_summary
-      FROM chunks c
-      JOIN files f ON c.file_id = f.id
-      JOIN repos r ON f.repo_id = r.id
-      WHERE c.construct_name IS NOT NULL AND c.token_count >= ?
+      SELECT construct_name, construct_type,
+             COUNT(*) as file_count,
+             SUM(file_tokens) as total_tokens,
+             MAX(any_summary) as ai_summary,
+             GROUP_CONCAT(path || char(31) || file_tokens, char(10)) as file_list
+      FROM (
+        SELECT c.construct_name, c.construct_type, f.path,
+               SUM(c.token_count) as file_tokens,
+               MAX(c.ai_summary) as any_summary
+        FROM chunks c
+        JOIN files f ON c.file_id = f.id
+        JOIN repos r ON f.repo_id = r.id
+        WHERE c.construct_name IS NOT NULL AND c.token_count >= ?
       """
     if resolvedRepoId != nil { sql += " AND r.id = ?" }
     sql += """
-       GROUP BY c.construct_name, c.construct_type
-       HAVING COUNT(DISTINCT f.id) > 1
-       ORDER BY total_tokens DESC
-       LIMIT ?
+        GROUP BY c.construct_name, c.construct_type, f.path
+      )
+      GROUP BY construct_name, construct_type
+      HAVING COUNT(*) > 1
+      ORDER BY total_tokens DESC
+      LIMIT ?
       """
 
     var stmt: OpaquePointer?
@@ -438,6 +451,15 @@ extension RAGStore {
       let fileCount = Int(sqlite3_column_int(stmt, 2))
       let totalTokens = Int(sqlite3_column_int(stmt, 3))
       let aiSummary = sqlite3_column_text(stmt, 4).map { String(cString: $0) }
+      let fileList = sqlite3_column_text(stmt, 5).map { String(cString: $0) } ?? ""
+      let files: [(path: String, tokenCount: Int)] = fileList
+        .split(separator: "\n")
+        .compactMap { entry in
+          let parts = entry.split(separator: "\u{1F}", maxSplits: 1)
+          guard parts.count == 2, let tokens = Int(parts[1]) else { return nil }
+          return (path: String(parts[0]), tokenCount: tokens)
+        }
+        .sorted { $0.tokenCount > $1.tokenCount }
 
       groups.append(DuplicateGroup(
         constructName: name,
@@ -446,7 +468,7 @@ extension RAGStore {
         totalTokens: totalTokens,
         wastedTokens: totalTokens - (totalTokens / fileCount),
         aiSummary: aiSummary,
-        files: []
+        files: files
       ))
     }
 
