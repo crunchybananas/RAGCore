@@ -616,7 +616,7 @@ extension RAGStore {
   /// Backfill repo_identifier for existing repos.
   internal func backfillRepoIdentifiersSync() {
     guard let db else { return }
-    let sql = "SELECT id, root_path FROM repos WHERE repo_identifier IS NULL"
+    let sql = "SELECT id, root_path FROM repos WHERE repo_identifier IS NULL OR repo_identifier = ''"
     var stmt: OpaquePointer?
     guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return }
     defer { sqlite3_finalize(stmt) }
@@ -625,9 +625,12 @@ extension RAGStore {
     while sqlite3_step(stmt) == SQLITE_ROW {
       let id = String(cString: sqlite3_column_text(stmt, 0))
       let rootPath = String(cString: sqlite3_column_text(stmt, 1))
-      if let identifier = Self.discoverNormalizedRemoteURL(for: rootPath) {
-        updates.append((id, identifier))
-      }
+      // Only repair ON-DISK repos: an off-disk overlay's identity comes from the
+      // sync manifest, not a local:// fallback. discoverCanonicalIdentifier is
+      // never empty for a real path (remote → commit://<hash> → local://). #1509
+      var isDir: ObjCBool = false
+      guard FileManager.default.fileExists(atPath: rootPath, isDirectory: &isDir), isDir.boolValue else { continue }
+      updates.append((id, Self.discoverCanonicalIdentifier(for: rootPath)))
     }
 
     for update in updates {

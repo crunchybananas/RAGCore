@@ -154,7 +154,13 @@ extension RAGStore {
     }
     let repoName = repoURL.lastPathComponent
     let now = dateFormatter.string(from: Date())
-    let repoIdentifier = Self.discoverNormalizedRemoteURL(for: path)
+    // Canonical, never-empty identity (remote URL → commit://<hash> → local://),
+    // preferring the stronger of the existing stored value and a fresh discovery
+    // so a transient git/remote failure can't downgrade a good identifier (#1509).
+    let repoIdentifier = Self.preferredIdentifier(
+      existing: storedRepoIdentifier(forId: repoId),
+      discovered: Self.discoverCanonicalIdentifier(for: path)
+    )
 
     try upsertRepo(
       id: repoId,

@@ -692,6 +692,71 @@ public actor RAGStore {
     }
   }
 
+  /// Synchronously discover the first (root) commit hash for a repo path.
+  /// Mirrors `discoverNormalizedRemoteURL` but runs `git rev-list
+  /// --max-parents=0 HEAD`. When unrelated histories were merged there can be
+  /// several roots — take the last (oldest) line, matching RepoRegistry's
+  /// `Commands.rootCommitHash`.
+  public static func discoverFirstCommitHash(for path: String) -> String? {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    process.arguments = ["rev-list", "--max-parents=0", "HEAD"]
+    process.currentDirectoryURL = URL(fileURLWithPath: path)
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = FileHandle.nullDevice
+    do {
+      try process.run()
+      process.waitUntilExit()
+      guard process.terminationStatus == 0 else { return nil }
+      let data = pipe.fileHandleForReading.readDataToEndOfFile()
+      guard let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !output.isEmpty else { return nil }
+      let root = output.split(separator: "\n").last.map(String.init) ?? output
+      let hash = root.trimmingCharacters(in: .whitespacesAndNewlines)
+      return hash.isEmpty ? nil : hash
+    } catch {
+      return nil
+    }
+  }
+
+  /// Canonical, NEVER-EMPTY identity for a repo path (#1509). Preference order
+  /// (matches RepoRegistry.resolveIdentifier and #1258's live-validated design):
+  ///   1. Normalized git remote URL — unique and stable, and what swarm dispatch
+  ///      keys on. Preferred because a first-commit hash is NOT unique: repos
+  ///      seeded from a shared template share a root commit (#1258), so the hash
+  ///      must never override a real remote.
+  ///   2. `commit://<first-commit-hash>` — a git repo with commits but no remote.
+  ///      The swarm knows such a repo only by this hash.
+  ///   3. `local://<path>` — last resort for a directory that is not a git repo
+  ///      (or has no commits), so `repo_identifier` is never null/empty. Weakest
+  ///      identity; eligible for upgrade on a later re-index.
+  public static func discoverCanonicalIdentifier(for path: String) -> String {
+    if let url = discoverNormalizedRemoteURL(for: path) { return url }
+    if let hash = discoverFirstCommitHash(for: path) { return "commit://\(hash)" }
+    return "local://\(path)"
+  }
+
+  /// Identity strength for upgrade/downgrade decisions: remote URL (2) beats
+  /// `commit://` (1) beats `local://` (0). A bare (non-scheme) string is a remote
+  /// URL / `github.com/owner/repo` identifier — the strongest.
+  static func identifierStrength(_ identifier: String) -> Int {
+    if identifier.hasPrefix("local://") { return 0 }
+    if identifier.hasPrefix("commit://") { return 1 }
+    return 2
+  }
+
+  /// Choose the identifier to persist when re-indexing a repo. Prefers the
+  /// STRONGER of the existing stored value and a freshly-discovered one so a
+  /// transient git/remote failure (which degrades discovery to `commit://` or
+  /// `local://`) can never downgrade a good stored identity, while an empty or
+  /// weaker stored value is still upgraded (#1509). Ties keep the existing value
+  /// (no churn); a nil/empty existing value always yields the discovered one.
+  static func preferredIdentifier(existing: String?, discovered: String) -> String {
+    guard let existing, !existing.isEmpty else { return discovered }
+    return identifierStrength(discovered) > identifierStrength(existing) ? discovered : existing
+  }
+
   // MARK: - Repo Identity Resolution
 
   /// Resolved repo record containing the database ID and current root path.
@@ -736,7 +801,20 @@ public actor RAGStore {
       remoteURLCache[repoPath] = normalizedURL
     }
 
-    guard let identifier = normalizedURL else { return nil }
+    // Fall back to the commit://<first-commit-hash> identity when there is no
+    // remote, so a no-remote repo resolves by IDENTITY (not just an exact path
+    // match) when the same repo lives at a different path or was synced from a
+    // machine that knows it only by hash (#1509). A remote URL is preferred
+    // (unique); the hash is a fallback since template-seeded repos can share a
+    // root commit (#1258).
+    let identifier: String
+    if let normalizedURL {
+      identifier = normalizedURL
+    } else if let hash = Self.discoverFirstCommitHash(for: repoPath) {
+      identifier = "commit://\(hash)"
+    } else {
+      return nil
+    }
 
     // 3. Match by repo_identifier
     // IMPORTANT: A single remote URL can map to multiple local repo entries
@@ -799,6 +877,21 @@ public actor RAGStore {
       return resolved.id
     }
     return VectorMath.stableId(for: repoPath)
+  }
+
+  /// The stored `repo_identifier` for a repo id, or nil when the row is absent
+  /// or the column is null/empty. Used at index time to avoid downgrading an
+  /// existing stable identity (#1509).
+  internal func storedRepoIdentifier(forId repoId: String) -> String? {
+    guard let db else { return nil }
+    let sql = "SELECT repo_identifier FROM repos WHERE id = ? LIMIT 1"
+    var stmt: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else { return nil }
+    defer { sqlite3_finalize(s) }
+    bindText(s, 1, repoId)
+    guard sqlite3_step(s) == SQLITE_ROW, let c = sqlite3_column_text(s, 0) else { return nil }
+    let value = String(cString: c)
+    return value.isEmpty ? nil : value
   }
 
   // MARK: - Repo Path Remapping

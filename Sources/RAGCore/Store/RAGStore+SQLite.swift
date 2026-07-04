@@ -259,7 +259,7 @@ extension RAGStore {
         name = excluded.name,
         root_path = excluded.root_path,
         last_indexed_at = excluded.last_indexed_at,
-        repo_identifier = COALESCE(excluded.repo_identifier, repos.repo_identifier),
+        repo_identifier = COALESCE(NULLIF(excluded.repo_identifier, ''), repos.repo_identifier),
         parent_repo_id = excluded.parent_repo_id,
         embedding_model = COALESCE(excluded.embedding_model, repos.embedding_model),
         embedding_dimensions = CASE
