@@ -22,10 +22,10 @@ struct RAGCoreTests {
   }
 
   @Test("VectorMath encode/decode roundtrip")
-  func vectorRoundtrip() {
+  func vectorRoundtrip() throws {
     let original: [Float] = [1.0, 2.5, -3.14, 0.0]
     let encoded = VectorMath.encodeVector(original)
-    let decoded = VectorMath.decodeVector(encoded)
+    let decoded = try #require(VectorMath.decodeVector(encoded))
     #expect(decoded.count == original.count)
     for (a, b) in zip(original, decoded) {
       #expect(abs(a - b) < 0.0001)

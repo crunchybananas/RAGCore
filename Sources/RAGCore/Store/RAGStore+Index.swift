@@ -48,7 +48,7 @@ extension RAGStore {
       let subPackages = detectSubPackages(rootURL: repoURL, excludingGitRepos: workspaceRepos)
       let allSubPaths = workspaceRepos + subPackages
       let parentRepoId: String
-      if let resolved = try resolveRepo(for: path) {
+      if let resolved = try resolveRepo(for: path, remapRootPathOnMismatch: true) {
         parentRepoId = resolved.id
       } else {
         parentRepoId = VectorMath.stableId(for: path)
@@ -77,7 +77,7 @@ extension RAGStore {
       for (idx, subPath) in allSubPaths.enumerated() {
         let subURL = URL(fileURLWithPath: subPath)
         let subRepoId: String
-        if let resolved = try resolveRepo(for: subPath) {
+        if let resolved = try resolveRepo(for: subPath, remapRootPathOnMismatch: true) {
           subRepoId = resolved.id
         } else {
           subRepoId = VectorMath.stableId(for: subPath)
@@ -147,7 +147,7 @@ extension RAGStore {
     progress?(.scanning(fileCount: scannedFiles.count))
 
     let repoId: String
-    if let resolved = try resolveRepo(for: path) {
+    if let resolved = try resolveRepo(for: path, remapRootPathOnMismatch: true) {
       repoId = resolved.id
     } else {
       repoId = VectorMath.stableId(for: path)

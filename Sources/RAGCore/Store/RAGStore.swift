@@ -706,11 +706,21 @@ public actor RAGStore {
   /// 1. Check if `root_path` matches directly (fast path for local repos).
   /// 2. Discover the git remote URL for the given path, normalize it.
   /// 3. Match by `repo_identifier` (normalized git remote URL).
-  /// 4. If found via identifier and `root_path` differs, auto-update `root_path`.
+  /// 4. If found via identifier and `root_path` differs, update `root_path` ONLY
+  ///    when `remapRootPathOnMismatch` is true (an explicit reindex/move).
   ///
-  /// - Parameter repoPath: Absolute filesystem path to the repository.
-  /// - Returns: The resolved repo record, or nil if no matching repo found.
-  public func resolveRepo(for repoPath: String) throws -> ResolvedRepo? {
+  /// - Parameters:
+  ///   - repoPath: Absolute filesystem path to the repository.
+  ///   - remapRootPathOnMismatch: When true and the repo is matched by identifier
+  ///     at a path that differs from the stored `root_path`, rewrite `root_path`
+  ///     (and `name`) to `repoPath` — the "repo moved / reindexed here" case.
+  ///     Defaults to **false** so read/query callers never mutate the canonical
+  ///     `root_path`: a nested, mistyped, or foreign path that happens to share a
+  ///     remote identifier must NOT silently rebind the repo (crunchybananas/RAGCore#2).
+  /// - Returns: The resolved repo record, or nil if no matching repo found. When
+  ///   the path differs and remap is off, the returned `rootPath` is the STORED
+  ///   canonical path, not the queried one.
+  public func resolveRepo(for repoPath: String, remapRootPathOnMismatch: Bool = false) throws -> ResolvedRepo? {
     try openIfNeeded()
     guard let db else { return nil }
 
@@ -773,18 +783,34 @@ public actor RAGStore {
 
       guard let selected else { return nil }
 
-      // 4. Auto-update root_path and name if they differ (repo moved/renamed or synced from another machine)
+      // 4. root_path drifted (repo moved/renamed or synced from another machine).
+      //    Only rewrite it when the caller explicitly opts in — indexing does;
+      //    read/query paths must not, or a nested/mistyped/foreign query that
+      //    shares a remote identifier would silently corrupt the canonical
+      //    root_path (crunchybananas/RAGCore#2).
       if selected.path != repoPath {
-        let escapedPath = repoPath.replacingOccurrences(of: "'", with: "''")
-        let newName = URL(fileURLWithPath: repoPath).lastPathComponent
-        let escapedName = newName.replacingOccurrences(of: "'", with: "''")
-        try? exec("UPDATE repos SET root_path = '\(escapedPath)', name = '\(escapedName)' WHERE id = '\(selected.id)'")
-        print("[RAG] Auto-remapped repo \(identifier): \(selected.path) → \(repoPath)")
+        if remapRootPathOnMismatch {
+          let escapedPath = repoPath.replacingOccurrences(of: "'", with: "''")
+          let newName = URL(fileURLWithPath: repoPath).lastPathComponent
+          let escapedName = newName.replacingOccurrences(of: "'", with: "''")
+          try? exec("UPDATE repos SET root_path = '\(escapedPath)', name = '\(escapedName)' WHERE id = '\(selected.id)'")
+          print("[RAG] Auto-remapped repo \(identifier): \(selected.path) → \(repoPath)")
+          return ResolvedRepo(id: selected.id, rootPath: repoPath)
+        }
+        // No remap: return the STORED canonical path and leave the DB untouched.
+        return ResolvedRepo(id: selected.id, rootPath: selected.path)
       }
       return ResolvedRepo(id: selected.id, rootPath: repoPath)
     }
 
     return nil
+  }
+
+  /// Test seam: seed the remote-URL cache so `resolveRepo(for:)` can match by
+  /// `repo_identifier` without discovering a real git remote. Internal — not
+  /// part of the public API; used only by the package's own tests.
+  internal func seedRemoteURLCache(path: String, identifier: String?) {
+    remoteURLCache[path] = identifier
   }
 
   /// Resolve a filesystem path to a repo ID.
