@@ -78,7 +78,7 @@ public struct RAGFileScanner: Sendable {
       return []
     }
 
-    let ignorePatterns = loadIgnorePatterns(rootURL: rootURL)
+    let ignorePatterns = Self.loadIgnorePatterns(rootURL: rootURL)
     var results: [RAGFileCandidate] = []
 
     for case let fileURL as URL in enumerator {
@@ -146,13 +146,16 @@ public struct RAGFileScanner: Sendable {
         return true
       }
     }
-    if matchesIgnore(url: url, rootURL: rootURL, patterns: ignorePatterns) {
+    if Self.matchesIgnore(url: url, rootURL: rootURL, patterns: ignorePatterns) {
       return true
     }
     return false
   }
 
-  private func loadIgnorePatterns(rootURL: URL) -> [String] {
+  /// Parse the scan root's `.ragignore` into raw patterns. Shared with the
+  /// workspace/sub-package detectors so directory discovery honors the same
+  /// ignore file as file scanning (crunchybananas/RAGCore#4).
+  internal static func loadIgnorePatterns(rootURL: URL) -> [String] {
     let ignoreURL = rootURL.appendingPathComponent(".ragignore")
     guard let contents = try? String(contentsOf: ignoreURL, encoding: .utf8) else {
       return []
@@ -163,7 +166,14 @@ public struct RAGFileScanner: Sendable {
       .filter { !$0.isEmpty && !$0.hasPrefix("#") }
   }
 
-  private func matchesIgnore(url: URL, rootURL: URL, patterns: [String]) -> Bool {
+  /// Match a path against `.ragignore` patterns.
+  ///
+  /// - Parameter isDirectory: When true, a trailing-slash directory pattern
+  ///   (`build-ios-check/`) also matches the directory itself, not only paths
+  ///   under it — file scanning only needs the children to match (the walk
+  ///   skips them one by one), but directory discovery must prune the
+  ///   directory node.
+  internal static func matchesIgnore(url: URL, rootURL: URL, patterns: [String], isDirectory: Bool = false) -> Bool {
     guard !patterns.isEmpty else { return false }
     let path = url.path
     let rootPath = rootURL.path.hasSuffix("/") ? rootURL.path : rootURL.path + "/"
@@ -173,7 +183,14 @@ public struct RAGFileScanner: Sendable {
     for pattern in patterns {
       if fnmatch(pattern, relative, 0) == 0 { return true }
       if fnmatch(pattern, fileName, 0) == 0 { return true }
-      if pattern.hasSuffix("/") && relative.hasPrefix(pattern) { return true }
+      if pattern.hasSuffix("/") {
+        if relative.hasPrefix(pattern) { return true }
+        if isDirectory {
+          let stripped = String(pattern.dropLast())
+          if fnmatch(stripped, relative, 0) == 0 { return true }
+          if fnmatch(stripped, fileName, 0) == 0 { return true }
+        }
+      }
     }
     return false
   }

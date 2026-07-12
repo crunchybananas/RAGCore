@@ -522,6 +522,43 @@ public actor RAGStore {
 
   // MARK: - Workspace Detection
 
+  /// Directory filter shared by `detectWorkspaceRepos` / `detectSubPackages`.
+  ///
+  /// Nested git checkouts inside build output must never count as workspace
+  /// members: SPM's `SourcePackages/{checkouts,repositories}` holds a git
+  /// repo per dependency, so an alternate derived-data directory inside an
+  /// app repo made the repo look like a multi-repo workspace and
+  /// `indexRepository`'s split branch registered + indexed every vendored
+  /// dependency (crunchybananas/RAGCore#4). On top of the hardcoded names,
+  /// this honors the scan root's `.ragignore` — the same file the file
+  /// scanner reads — so hosts can prune discovery without a RAGCore change.
+  internal struct WorkspaceScanFilter {
+    /// Superset of `RAGFileScanner.defaultExcludedDirectories` plus
+    /// dependency-vendoring dirs that only matter for repo discovery.
+    static let excludedDirectoryNames: Set<String> =
+      RAGFileScanner.defaultExcludedDirectories.union(["SourcePackages", "Pods"])
+
+    private let rootURL: URL
+    private let ignorePatterns: [String]
+
+    init(rootURL: URL) {
+      self.rootURL = rootURL
+      self.ignorePatterns = RAGFileScanner.loadIgnorePatterns(rootURL: rootURL)
+    }
+
+    /// True when this directory (and everything under it) must be pruned
+    /// from workspace/sub-package discovery.
+    func shouldSkip(_ url: URL) -> Bool {
+      let name = url.lastPathComponent
+      if Self.excludedDirectoryNames.contains(name) { return true }
+      // Xcode derived-data content is Spotlight-opted-out via `.noindex`
+      // (Index.noindex, CompilationCache.noindex) — never a workspace member.
+      if name.hasSuffix(".noindex") { return true }
+      return RAGFileScanner.matchesIgnore(
+        url: url, rootURL: rootURL, patterns: ignorePatterns, isDirectory: true)
+    }
+  }
+
   internal func detectWorkspaceRepos(rootURL: URL) -> [String] {
     let resolvedRoot = rootURL.resolvingSymlinksInPath()
     guard let enumerator = FileManager.default.enumerator(
@@ -532,7 +569,7 @@ public actor RAGStore {
       return []
     }
 
-    let excluded = Set([".git", ".build", ".swiftpm", "build", "dist", "DerivedData", "node_modules", "coverage", "tmp", "Carthage", ".turbo", "__snapshots__", "vendor"])
+    let filter = WorkspaceScanFilter(rootURL: resolvedRoot)
     let baseDepth = resolvedRoot.pathComponents.count
     var repos: [String] = []
 
@@ -540,7 +577,7 @@ public actor RAGStore {
       let depth = url.pathComponents.count - baseDepth
       if depth <= 0 { continue }
       if depth > 4 { enumerator.skipDescendants(); continue }
-      if excluded.contains(url.lastPathComponent) { enumerator.skipDescendants(); continue }
+      if filter.shouldSkip(url) { enumerator.skipDescendants(); continue }
       guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
       if isGitRepo(at: url) {
         repos.append(url.path)
@@ -561,7 +598,7 @@ public actor RAGStore {
       return []
     }
 
-    let excluded = Set([".git", ".build", ".swiftpm", "build", "dist", "DerivedData", "node_modules", "coverage", "tmp", "Carthage", ".turbo", "__snapshots__", "vendor"])
+    let filter = WorkspaceScanFilter(rootURL: resolvedRoot)
     let baseDepth = resolvedRoot.pathComponents.count
     let rootPath = resolvedRoot.path
     var packages: [String] = []
@@ -572,7 +609,7 @@ public actor RAGStore {
       if depth <= 0 { continue }
       if depth > 4 { enumerator.skipDescendants(); continue }
       let lastName = url.lastPathComponent
-      if excluded.contains(lastName) { enumerator.skipDescendants(); continue }
+      if filter.shouldSkip(url) { enumerator.skipDescendants(); continue }
 
       let urlPath = url.path
       if gitRepoSet.contains(where: { urlPath == $0 || urlPath.hasPrefix($0 + "/") }) {
