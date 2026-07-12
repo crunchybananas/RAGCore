@@ -89,6 +89,8 @@ struct WorkspaceDetectionTests {
     try addGitRepo(root, "real-repo")
     try addGitRepo(root, "build-ios-check/vendored-dep")
     try addGitRepo(root, "nested/generated-vendor/dep")
+    // gitignore semantics: `**/x/` matches x at ANY depth, including root.
+    try addGitRepo(root, "generated-vendor/root-level-dep")
 
     let repos = await store.detectWorkspaceRepos(rootURL: root)
     #expect(repos.map { URL(fileURLWithPath: $0).lastPathComponent } == ["real-repo"])
@@ -119,5 +121,22 @@ struct WorkspaceDetectionTests {
 
     let packages = await store.detectSubPackages(rootURL: root, excludingGitRepos: [])
     #expect(packages.map { URL(fileURLWithPath: $0).lastPathComponent } == ["web"])
+  }
+
+  @Test("file patterns in .ragignore do not swallow manifest FILES")
+  func filePatternsDoNotSuppressManifests() async throws {
+    // `*.json` (or `*.toml`, …) in the root .ragignore is a file-CONTENT
+    // exclusion; it must not delete the package from index topology by
+    // hiding its manifest from detection. Directory-mode matching only
+    // applies to directories.
+    let store = try await makeStore()
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try write(root, ".ragignore", "*.json\n*.toml\n")
+    try write(root, "apps/web/package.json", "{}")
+    try write(root, "services/agent/Cargo.toml", "[package]")
+
+    let packages = await store.detectSubPackages(rootURL: root, excludingGitRepos: [])
+    #expect(packages.map { URL(fileURLWithPath: $0).lastPathComponent }.sorted() == ["agent", "web"])
   }
 }

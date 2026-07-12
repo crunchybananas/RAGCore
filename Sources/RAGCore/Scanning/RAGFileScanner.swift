@@ -189,6 +189,15 @@ public struct RAGFileScanner: Sendable {
           let stripped = String(pattern.dropLast())
           if fnmatch(stripped, relative, 0) == 0 { return true }
           if fnmatch(stripped, fileName, 0) == 0 { return true }
+          // gitignore semantics: `**/foo/` matches foo at ANY depth,
+          // including the root — but the stripped pattern's literal `/`
+          // after `**` can never match a root-level name, so also try with
+          // the `**/` prefix removed.
+          if stripped.hasPrefix("**/") {
+            let anchored = String(stripped.dropFirst(3))
+            if fnmatch(anchored, relative, 0) == 0 { return true }
+            if fnmatch(anchored, fileName, 0) == 0 { return true }
+          }
         }
       }
     }
