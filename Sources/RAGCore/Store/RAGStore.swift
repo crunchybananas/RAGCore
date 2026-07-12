@@ -577,8 +577,12 @@ public actor RAGStore {
       let depth = url.pathComponents.count - baseDepth
       if depth <= 0 { continue }
       if depth > 4 { enumerator.skipDescendants(); continue }
-      if filter.shouldSkip(url) { enumerator.skipDescendants(); continue }
+      // Only directories are candidates AND only directories may be pruned:
+      // ignore matching runs in directory mode, so applying it to files would
+      // let plain file patterns (e.g. `*.json`) fire on names they were never
+      // meant to prune.
       guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
+      if filter.shouldSkip(url) { enumerator.skipDescendants(); continue }
       if isGitRepo(at: url) {
         repos.append(url.path)
         enumerator.skipDescendants()
@@ -609,7 +613,12 @@ public actor RAGStore {
       if depth <= 0 { continue }
       if depth > 4 { enumerator.skipDescendants(); continue }
       let lastName = url.lastPathComponent
-      if filter.shouldSkip(url) { enumerator.skipDescendants(); continue }
+      // Prune DIRECTORIES only. The filter's ignore matching runs in
+      // directory mode; letting it fire on files would make a root
+      // `.ragignore` pattern like `*.json` swallow `package.json` manifests
+      // below — silently dropping whole sub-packages from the index.
+      let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+      if isDirectory && filter.shouldSkip(url) { enumerator.skipDescendants(); continue }
 
       let urlPath = url.path
       if gitRepoSet.contains(where: { urlPath == $0 || urlPath.hasPrefix($0 + "/") }) {
