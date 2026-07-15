@@ -7,6 +7,7 @@
 
 import CSQLite
 import Foundation
+import SQLiteVec
 
 extension RAGStore {
 
@@ -14,6 +15,7 @@ extension RAGStore {
 
   internal func openIfNeeded() throws {
     guard db == nil else { return }
+
     let dir = dbURL.deletingLastPathComponent()
     if !FileManager.default.fileExists(atPath: dir.path) {
       try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -21,54 +23,44 @@ extension RAGStore {
     var handle: OpaquePointer?
     let result = sqlite3_open(dbURL.path, &handle)
     guard result == SQLITE_OK, let handle else {
+      if let handle {
+        sqlite3_close(handle)
+      }
       throw RAGError.sqlite("Cannot open database: \(result)")
     }
     db = handle
 
-    // DELETE journal mode: avoids WAL SHM mmap which causes SIGBUS on macOS 26 Tahoe.
-    // Files with com.apple.provenance xattr (all files created post Jan-30 on Tahoe)
-    // fail mmap pagein with FS pagein error 22 (EINVAL). The WAL-index SHM file is
-    // always mmap'd in WAL mode regardless of PRAGMA mmap_size, so WAL mode is
-    // fundamentally incompatible with com.apple.provenance on macOS 26.
-    // DELETE mode has slightly lower write throughput but is safe with single-writer
-    // workloads (MLX analysis). Reads no longer require SHM/WAL mmap.
-    try exec("PRAGMA journal_mode=DELETE")
-    try exec("PRAGMA busy_timeout=5000")
-    // Disable memory-mapped I/O for the main database file as well.
-    try exec("PRAGMA mmap_size=0")
-  }
-
-  /// Try to load sqlite-vec extension for accelerated vector search.
-  internal func loadExtensionIfAvailable(extensionPath: String? = nil) {
-    guard let db else { return }
-    sqlite3_enable_load_extension(db, 1)
-
-    var paths: [String] = []
-    if let explicit = extensionPath {
-      paths.append(explicit)
-    }
-
-    // Try common locations
-    let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-    if let appSupport {
-      paths.append(appSupport.appendingPathComponent("Peel/vec0.dylib").path)
-    }
-    paths.append("/usr/local/lib/vec0.dylib")
-    paths.append("/opt/homebrew/lib/vec0.dylib")
-
-    for path in paths {
-      guard FileManager.default.fileExists(atPath: path) else { continue }
-      var errMsg: UnsafeMutablePointer<CChar>?
-      let rc = sqlite3_load_extension(db, path, nil, &errMsg)
-      if rc == SQLITE_OK {
-        extensionLoaded = true
-        print("[RAG] sqlite-vec extension loaded from \(path)")
-        return
+    do {
+      var extensionError: UnsafeMutablePointer<CChar>?
+      let extensionResult = sqlite_vec_initialize(handle, &extensionError)
+      guard extensionResult == SQLITE_OK else {
+        let detail = extensionError.map { String(cString: $0) } ?? "SQLite error \(extensionResult)"
+        sqlite3_free(extensionError)
+        throw RAGError.sqlite("Cannot initialize statically linked sqlite-vec: \(detail)")
       }
-      if let err = errMsg {
-        print("[RAG] Failed to load extension from \(path): \(String(cString: err))")
-        sqlite3_free(err)
+
+      // DELETE journal mode avoids WAL SHM mmap failures on macOS 26 Tahoe.
+      try exec("PRAGMA journal_mode=DELETE")
+      try exec("PRAGMA busy_timeout=5000")
+      try exec("PRAGMA mmap_size=0")
+
+      let compiledVersion = String(cString: sqlite_vec_compiled_version())
+      guard let runtimeVersion = try queryString("SELECT vec_version()") else {
+        throw RAGError.sqlite("Statically linked sqlite-vec did not initialize")
       }
+      guard runtimeVersion == compiledVersion else {
+        throw RAGError.sqlite(
+          "sqlite-vec version mismatch: compiled \(compiledVersion), runtime \(runtimeVersion)"
+        )
+      }
+      extensionLoaded = true
+      extensionVersion = runtimeVersion
+    } catch {
+      sqlite3_close(handle)
+      db = nil
+      extensionLoaded = false
+      extensionVersion = nil
+      throw error
     }
   }
 
@@ -467,150 +459,83 @@ extension RAGStore {
       try setSchemaVersion(18)
     }
 
-    // Set up vec table if extension is loaded
-    if extensionLoaded {
+    // Unknown-model providers learn their dimensions after the first embed.
+    if extensionLoaded && embeddingProvider.dimensions > 0 {
       try ensureVecTable()
     }
   }
 
-  internal func ensureVecTable() throws {
-    guard extensionLoaded else { return }
-    guard let db else { return }
-    let dims = embeddingProvider.dimensions
+  internal func ensureVecTable(dimensions explicitDimensions: Int? = nil) throws {
+    guard extensionLoaded else {
+      throw RAGError.sqlite("sqlite-vec is not initialized")
+    }
+    guard db != nil else { throw RAGError.sqlite("Database not initialized") }
 
-    // Check if vec_chunks already exists with a different dimension.
-    // CREATE VIRTUAL TABLE IF NOT EXISTS is a no-op on existing tables,
-    // so a dimension change (e.g. nomic 768d → Qwen3 1024d) would leave
-    // the old table in place, causing every INSERT to fail with a
-    // dimension mismatch error.
-    let tableExistsSql = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='vec_chunks'"
-    let exists = (try? queryInt(tableExistsSql)) ?? 0 > 0
+    let dimensions = explicitDimensions ?? embeddingProvider.dimensions
+    guard dimensions > 0 else {
+      throw RAGError.embeddingFailed("Cannot create vector index before embedding dimensions are known")
+    }
 
-    if exists {
-      // Probe the actual dimension by reading one embedding blob size.
-      // vec0 stores float vectors, so floatCount = blobSize / 4.
-      var probeDims = 0
-      let probeSql = "SELECT embedding FROM vec_chunks LIMIT 1"
-      var stmt: OpaquePointer?
-      if sqlite3_prepare_v2(db, probeSql, -1, &stmt, nil) == SQLITE_OK, let stmt {
-        defer { sqlite3_finalize(stmt) }
-        if sqlite3_step(stmt) == SQLITE_ROW {
-          let blobSize = Int(sqlite3_column_bytes(stmt, 0))
-          probeDims = blobSize / MemoryLayout<Float>.size
-        }
-      }
+    let signature = "v2:\(dimensions):cosine:repo-partition"
+    let tableExists = try queryInt(
+      "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='vec_chunks'"
+    ) > 0
+    let storedSignature = try queryString(
+      "SELECT value FROM rag_meta WHERE key = 'vec_schema_signature'"
+    )
 
-      if probeDims > 0 && probeDims != dims {
-        print("[RAG] vec_chunks dimension mismatch: table has \(probeDims)d, provider needs \(dims)d — rebuilding")
-        try exec("DROP TABLE vec_chunks")
-        // Fall through to CREATE below
-      } else if probeDims == dims {
-        return // Table exists with correct dimensions
-      }
-      // probeDims == 0 means empty table — recreate to be safe
-      if probeDims == 0 {
-        // Empty table: drop and recreate to guarantee correct dimension declaration
-        try exec("DROP TABLE vec_chunks")
-      }
+    if tableExists && storedSignature == signature {
+      return
+    }
+
+    if tableExists {
+      print("[RAG] Rebuilding vec_chunks for schema \(signature)")
+      try exec("DROP TABLE vec_chunks")
     }
 
     try exec("""
-      CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0 (
+      CREATE VIRTUAL TABLE vec_chunks USING vec0 (
         chunk_id TEXT PRIMARY KEY,
-        embedding float[\(dims)]
+        repo_id TEXT PARTITION KEY,
+        embedding float[\(dimensions)] distance_metric=cosine
       )
       """)
 
-    // If we just recreated the table, resync from embeddings blob table.
-    // Only sync embeddings that match the current dimension to avoid
-    // re-inserting stale vectors from a previous model.
-    if exists {
-      let embCount = (try? queryInt("SELECT COUNT(*) FROM embeddings")) ?? 0
-      if embCount > 0 {
-        let expectedBlobSize = dims * MemoryLayout<Float>.size
-        print("[RAG] Resyncing compatible embeddings to new vec_chunks (\(dims)d)")
-        try exec("BEGIN TRANSACTION")
-        do {
-          let sql = "SELECT chunk_id, embedding FROM embeddings WHERE LENGTH(embedding) = ?"
-          var selStmt: OpaquePointer?
-          let result = sqlite3_prepare_v2(db, sql, -1, &selStmt, nil)
-          guard result == SQLITE_OK, let selStmt else {
-            try exec("ROLLBACK")
-            return
-          }
-          defer { sqlite3_finalize(selStmt) }
-          sqlite3_bind_int(selStmt, 1, Int32(expectedBlobSize))
-
-          var synced = 0
-          while sqlite3_step(selStmt) == SQLITE_ROW {
-            let chunkId = String(cString: sqlite3_column_text(selStmt, 0))
-            guard let blob = sqlite3_column_blob(selStmt, 1) else { continue }
-            let blobSize = sqlite3_column_bytes(selStmt, 1)
-
-            let insertSql = "INSERT OR IGNORE INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)"
-            var insertStmt: OpaquePointer?
-            sqlite3_prepare_v2(db, insertSql, -1, &insertStmt, nil)
-            guard let insertStmt else { continue }
-            defer { sqlite3_finalize(insertStmt) }
-
-            sqlite3_bind_text(insertStmt, 1, chunkId, -1, sqliteTransient)
-            sqlite3_bind_blob(insertStmt, 2, blob, blobSize, sqliteTransient)
-            sqlite3_step(insertStmt)
-            synced += 1
-          }
-          try exec("COMMIT")
-          print("[RAG] Resynced \(synced) embeddings to vec_chunks")
-        } catch {
-          try? exec("ROLLBACK")
-          throw error
-        }
-      }
+    do {
+      try syncCompatibleEmbeddingsToVecTable(dimensions: dimensions)
+      try execute(
+        sql: "INSERT OR REPLACE INTO rag_meta (key, value) VALUES ('vec_schema_signature', ?)",
+        binder: { statement in bindText(statement, 1, signature) }
+      )
+    } catch {
+      try? exec("DROP TABLE vec_chunks")
+      throw error
     }
   }
 
   /// Sync existing embeddings into the vec_chunks table (initial population).
   public func syncVecTable() throws {
-    guard extensionLoaded else { return }
-    guard let db else { throw RAGError.sqlite("Database not initialized") }
+    try openIfNeeded()
+    try ensureSchema()
+    try ensureVecTable()
 
     let count = try queryInt("SELECT COUNT(*) FROM embeddings")
     let vecCount = try queryInt("SELECT COUNT(*) FROM vec_chunks")
     guard vecCount == 0 && count > 0 else { return }
 
-    print("[RAG] Syncing \(count) embeddings to vec_chunks")
-    try exec("BEGIN TRANSACTION")
-    do {
-      let sql = "SELECT chunk_id, embedding FROM embeddings"
-      var stmt: OpaquePointer?
-      let result = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
-      guard result == SQLITE_OK, let stmt else {
-        throw RAGError.sqlite("Failed to prepare sync query")
-      }
-      defer { sqlite3_finalize(stmt) }
+    try syncCompatibleEmbeddingsToVecTable(dimensions: embeddingProvider.dimensions)
+  }
 
-      var synced = 0
-      while sqlite3_step(stmt) == SQLITE_ROW {
-        let chunkId = String(cString: sqlite3_column_text(stmt, 0))
-        guard let blob = sqlite3_column_blob(stmt, 1) else { continue }
-        let blobSize = sqlite3_column_bytes(stmt, 1)
-
-        let insertSql = "INSERT OR IGNORE INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)"
-        var insertStmt: OpaquePointer?
-        sqlite3_prepare_v2(db, insertSql, -1, &insertStmt, nil)
-        guard let insertStmt else { continue }
-        defer { sqlite3_finalize(insertStmt) }
-
-        sqlite3_bind_text(insertStmt, 1, chunkId, -1, sqliteTransient)
-        sqlite3_bind_blob(insertStmt, 2, blob, blobSize, sqliteTransient)
-        sqlite3_step(insertStmt)
-        synced += 1
-      }
-      try exec("COMMIT")
-      print("[RAG] Synced \(synced) embeddings to vec_chunks")
-    } catch {
-      try? exec("ROLLBACK")
-      throw error
-    }
+  private func syncCompatibleEmbeddingsToVecTable(dimensions: Int) throws {
+    let expectedBytes = dimensions * MemoryLayout<Float>.size
+    try exec("""
+      INSERT OR IGNORE INTO vec_chunks (chunk_id, repo_id, embedding)
+      SELECT e.chunk_id, f.repo_id, e.embedding
+      FROM embeddings e
+      JOIN chunks c ON c.id = e.chunk_id
+      JOIN files f ON f.id = c.file_id
+      WHERE LENGTH(e.embedding) = \(expectedBytes)
+      """)
   }
 
   /// Backfill repo_identifier for existing repos.

@@ -20,10 +20,21 @@ let package = Package(
   ],
   targets: [
     .target(
+      name: "SQLiteVec",
+      dependencies: [
+        .product(name: "CSQLite", package: "MCPCore"),
+      ],
+      cSettings: [
+        .define("SQLITE_CORE"),
+        .define("SQLITE_VEC_STATIC"),
+      ]
+    ),
+    .target(
       name: "RAGCore",
       dependencies: [
         .product(name: "CSQLite", package: "MCPCore"),
         .product(name: "ASTChunker", package: "ast-chunker"),
+        "SQLiteVec",
       ]
     ),
     .testTarget(

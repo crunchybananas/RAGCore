@@ -354,6 +354,16 @@ extension RAGStore {
     limit: Int,
     excludePath: String?
   ) throws -> [RAGSimilarResult] {
+    try ensureVecTable(dimensions: queryVector.count)
+    if excludePath == nil {
+      return try findSimilarCodeKNN(
+        queryVector: queryVector,
+        resolvedRepoId: resolvedRepoId,
+        threshold: threshold,
+        limit: limit
+      )
+    }
+
     guard let db else { throw RAGError.sqlite("Database not initialized") }
 
     let sql = """
@@ -379,7 +389,7 @@ extension RAGStore {
     defer { sqlite3_finalize(stmt) }
 
     let vectorData = queryVector.withUnsafeBytes { Data($0) }
-    vectorData.withUnsafeBytes { ptr in
+    _ = vectorData.withUnsafeBytes { ptr in
       sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(vectorData.count), nil)
     }
 
@@ -405,6 +415,78 @@ extension RAGStore {
         similarity: similarity, constructType: constructType, constructName: constructName
       ))
       if results.count >= limit { break }
+    }
+    return results
+  }
+
+  private func findSimilarCodeKNN(
+    queryVector: [Float],
+    resolvedRepoId: String?,
+    threshold: Double,
+    limit: Int
+  ) throws -> [RAGSimilarResult] {
+    guard let db else { throw RAGError.sqlite("Database not initialized") }
+
+    var knnWhere = "embedding MATCH ?"
+    if resolvedRepoId != nil {
+      knnWhere += " AND repo_id = ?"
+    }
+    knnWhere += " AND k = ?"
+
+    let sql = """
+      WITH nearest AS (
+        SELECT chunk_id, distance
+        FROM vec_chunks
+        WHERE \(knnWhere)
+      )
+      SELECT
+        c.id, f.path, c.start_line, c.end_line, c.text,
+        c.construct_type, c.construct_name, nearest.distance
+      FROM nearest
+      JOIN chunks c ON c.id = nearest.chunk_id
+      JOIN files f ON f.id = c.file_id
+      ORDER BY nearest.distance ASC
+      """
+
+    var statement: OpaquePointer?
+    let prepareResult = sqlite3_prepare_v2(db, sql, -1, &statement, nil)
+    guard prepareResult == SQLITE_OK, let statement else {
+      throw RAGError.sqlite(String(cString: sqlite3_errmsg(db)))
+    }
+    defer { sqlite3_finalize(statement) }
+
+    let vectorData = VectorMath.encodeVector(queryVector)
+    _ = vectorData.withUnsafeBytes { bytes in
+      sqlite3_bind_blob(statement, 1, bytes.baseAddress, Int32(vectorData.count), sqliteTransient)
+    }
+    var bindIndex: Int32 = 2
+    if let resolvedRepoId {
+      bindText(statement, bindIndex, resolvedRepoId)
+      bindIndex += 1
+    }
+    sqlite3_bind_int(statement, bindIndex, Int32(max(1, limit)))
+
+    var results: [RAGSimilarResult] = []
+    while true {
+      let stepResult = sqlite3_step(statement)
+      if stepResult == SQLITE_DONE { break }
+      guard stepResult == SQLITE_ROW else {
+        throw RAGError.sqlite(String(cString: sqlite3_errmsg(db)))
+      }
+
+      let path = sqlite3_column_text(statement, 1).map { String(cString: $0) } ?? ""
+      let startLine = Int(sqlite3_column_int(statement, 2))
+      let endLine = Int(sqlite3_column_int(statement, 3))
+      let snippet = sqlite3_column_text(statement, 4).map { String(cString: $0) } ?? ""
+      let constructType = sqlite3_column_text(statement, 5).map { String(cString: $0) }
+      let constructName = sqlite3_column_text(statement, 6).map { String(cString: $0) }
+      let similarity = max(0.0, 1.0 - sqlite3_column_double(statement, 7))
+      guard similarity >= threshold else { continue }
+
+      results.append(RAGSimilarResult(
+        path: path, startLine: startLine, endLine: endLine, snippet: snippet,
+        similarity: similarity, constructType: constructType, constructName: constructName
+      ))
     }
     return results
   }

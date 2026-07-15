@@ -205,9 +205,83 @@ extension RAGStore {
     threshold: Float,
     modulePath: String?
   ) throws -> [RAGSearchResult] {
+    try ensureVecTable(dimensions: queryVector.count)
+
+    // A substring module filter cannot be pushed into a vec0 KNN query. Apply
+    // it before ranking with the scalar sqlite-vec distance function so the
+    // filter cannot incorrectly discard valid neighbors after a limited KNN.
+    if modulePath != nil {
+      return try searchVectorScalarFiltered(
+        queryVector: queryVector,
+        resolvedRepoId: resolvedRepoId,
+        limit: limit,
+        threshold: threshold,
+        modulePath: modulePath
+      )
+    }
+
     guard let db else { throw RAGError.sqlite("Database not initialized") }
 
-    // Use vec_distance_cosine for accelerated search
+    var knnWhere = "embedding MATCH ?"
+    if resolvedRepoId != nil {
+      knnWhere += " AND repo_id = ?"
+    }
+    knnWhere += " AND k = ?"
+
+    let sql = """
+      WITH nearest AS (
+        SELECT chunk_id, distance
+        FROM vec_chunks
+        WHERE \(knnWhere)
+      )
+      SELECT
+        repos.root_path || '/' || files.path,
+        chunks.start_line, chunks.end_line, chunks.text,
+        chunks.construct_type, chunks.construct_name,
+        files.language, files.module_path, files.feature_tags,
+        chunks.ai_summary, chunks.ai_tags, chunks.token_count,
+        nearest.distance
+      FROM nearest
+      JOIN chunks ON chunks.id = nearest.chunk_id
+      JOIN files ON files.id = chunks.file_id
+      JOIN repos ON repos.id = files.repo_id
+      ORDER BY nearest.distance ASC
+      """
+
+    var statement: OpaquePointer?
+    let prepareResult = sqlite3_prepare_v2(db, sql, -1, &statement, nil)
+    guard prepareResult == SQLITE_OK, let statement else {
+      throw RAGError.sqlite(String(cString: sqlite3_errmsg(db)))
+    }
+    defer { sqlite3_finalize(statement) }
+
+    let vectorData = VectorMath.encodeVector(queryVector)
+    _ = vectorData.withUnsafeBytes { bytes in
+      sqlite3_bind_blob(statement, 1, bytes.baseAddress, Int32(vectorData.count), sqliteTransient)
+    }
+    var bindIndex: Int32 = 2
+    if let resolvedRepoId {
+      bindText(statement, bindIndex, resolvedRepoId)
+      bindIndex += 1
+    }
+    sqlite3_bind_int(statement, bindIndex, Int32(max(1, limit)))
+
+    return try decodeAcceleratedSearchResults(
+      statement: statement,
+      limit: limit,
+      threshold: threshold
+    )
+  }
+
+  private func searchVectorScalarFiltered(
+    queryVector: [Float],
+    resolvedRepoId: String?,
+    limit: Int,
+    threshold: Float,
+    modulePath: String?
+  ) throws -> [RAGSearchResult] {
+    guard let db else { throw RAGError.sqlite("Database not initialized") }
+
     var sql = """
       SELECT
         repos.root_path || '/' || files.path,
@@ -235,7 +309,7 @@ extension RAGStore {
     defer { sqlite3_finalize(stmt) }
 
     let vectorData = queryVector.withUnsafeBytes { Data($0) }
-    vectorData.withUnsafeBytes { ptr in
+    _ = vectorData.withUnsafeBytes { ptr in
       sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(vectorData.count), nil)
     }
 
@@ -244,29 +318,42 @@ extension RAGStore {
     if let modulePath { bindText(stmt, bindIdx, "%\(modulePath.lowercased())%"); bindIdx += 1 }
     sqlite3_bind_int(stmt, bindIdx, Int32(limit * 2))
 
-    var results: [RAGSearchResult] = []
-    while sqlite3_step(stmt) == SQLITE_ROW {
-      let filePath = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? ""
-      let startLine = Int(sqlite3_column_int(stmt, 1))
-      let endLine = Int(sqlite3_column_int(stmt, 2))
-      let snippet = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? ""
-      let constructType = sqlite3_column_text(stmt, 4).map { String(cString: $0) }
-      let constructName = sqlite3_column_text(stmt, 5).map { String(cString: $0) }
-      let language = sqlite3_column_text(stmt, 6).map { String(cString: $0) }
-      let modPath = sqlite3_column_text(stmt, 7).map { String(cString: $0) }
-      let featureTagsJson = sqlite3_column_text(stmt, 8).map { String(cString: $0) }
-      let aiSummary = sqlite3_column_text(stmt, 9).map { String(cString: $0) }
-      let aiTagsJson = sqlite3_column_text(stmt, 10).map { String(cString: $0) }
-      let tokenCount = Int(sqlite3_column_int(stmt, 11))
-      let distance = Float(sqlite3_column_double(stmt, 12))
+    return try decodeAcceleratedSearchResults(statement: stmt, limit: limit, threshold: threshold)
+  }
 
-      let similarity = max(0, 1.0 - distance)
+  private func decodeAcceleratedSearchResults(
+    statement: OpaquePointer,
+    limit: Int,
+    threshold: Float
+  ) throws -> [RAGSearchResult] {
+    var results: [RAGSearchResult] = []
+    while true {
+      let stepResult = sqlite3_step(statement)
+      if stepResult == SQLITE_DONE { break }
+      guard stepResult == SQLITE_ROW else {
+        let message = db.map { String(cString: sqlite3_errmsg($0)) } ?? "Vector search failed"
+        throw RAGError.sqlite(message)
+      }
+
+      let filePath = sqlite3_column_text(statement, 0).map { String(cString: $0) } ?? ""
+      let startLine = Int(sqlite3_column_int(statement, 1))
+      let endLine = Int(sqlite3_column_int(statement, 2))
+      let snippet = sqlite3_column_text(statement, 3).map { String(cString: $0) } ?? ""
+      let constructType = sqlite3_column_text(statement, 4).map { String(cString: $0) }
+      let constructName = sqlite3_column_text(statement, 5).map { String(cString: $0) }
+      let language = sqlite3_column_text(statement, 6).map { String(cString: $0) }
+      let modulePath = sqlite3_column_text(statement, 7).map { String(cString: $0) }
+      let featureTagsJSON = sqlite3_column_text(statement, 8).map { String(cString: $0) }
+      let aiSummary = sqlite3_column_text(statement, 9).map { String(cString: $0) }
+      let aiTagsJSON = sqlite3_column_text(statement, 10).map { String(cString: $0) }
+      let tokenCount = Int(sqlite3_column_int(statement, 11))
+      let similarity = max(0, 1.0 - Float(sqlite3_column_double(statement, 12)))
       guard similarity >= threshold else { continue }
 
-      let featureTags = featureTagsJson.flatMap { json in
+      let featureTags = featureTagsJSON.flatMap { json in
         json.data(using: .utf8).flatMap { try? JSONDecoder().decode([String].self, from: $0) }
       }
-      let aiTags = aiTagsJson.flatMap { json in
+      let aiTags = aiTagsJSON.flatMap { json in
         json.data(using: .utf8).flatMap { try? JSONDecoder().decode([String].self, from: $0) }
       }
 
@@ -274,13 +361,11 @@ extension RAGStore {
         filePath: filePath, startLine: startLine, endLine: endLine,
         snippet: snippet, constructType: constructType, constructName: constructName,
         language: language, isTest: isTestFile(filePath), score: similarity,
-        modulePath: modPath, featureTags: featureTags ?? [],
+        modulePath: modulePath, featureTags: featureTags ?? [],
         aiSummary: aiSummary, aiTags: aiTags ?? [], tokenCount: tokenCount
       ))
-
       if results.count >= limit { break }
     }
-
     return results
   }
 

@@ -44,6 +44,7 @@ public actor RAGStore {
     public let exists: Bool
     public let schemaVersion: Int
     public let extensionLoaded: Bool
+    public let extensionVersion: String?
     public let lastInitializedAt: Date?
     public let providerName: String
     public let embeddingModelName: String
@@ -157,6 +158,7 @@ public actor RAGStore {
   internal var db: OpaquePointer?
   internal var schemaVersion: Int = 0
   internal var extensionLoaded: Bool = false
+  internal var extensionVersion: String?
   internal var lastInitializedAt: Date?
   internal let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
@@ -231,13 +233,24 @@ public actor RAGStore {
 
   // MARK: - Lifecycle
 
-  /// Initialize the database, loading extensions and ensuring schema is up to date.
-  public func initialize(extensionPath: String? = nil) throws -> Status {
+  /// Initialize the database and ensure its schema is up to date.
+  ///
+  /// sqlite-vec is statically linked into RAGCore and verified when the
+  /// connection opens. Initialization fails if vector support is unavailable.
+  public func initialize() throws -> Status {
     try openIfNeeded()
-    try loadExtensionIfAvailable(extensionPath: extensionPath)
     try ensureSchema()
     lastInitializedAt = Date()
     return status()
+  }
+
+  /// Source-compatible transition from runtime extension loading.
+  @available(*, deprecated, message: "sqlite-vec is statically linked; call initialize()")
+  public func initialize(extensionPath: String?) throws -> Status {
+    guard extensionPath == nil else {
+      throw RAGError.sqlite("External sqlite-vec extension paths are no longer supported")
+    }
+    return try initialize()
   }
 
   /// Current status of the store.
@@ -247,6 +260,7 @@ public actor RAGStore {
       exists: FileManager.default.fileExists(atPath: dbURL.path),
       schemaVersion: schemaVersion,
       extensionLoaded: extensionLoaded,
+      extensionVersion: extensionVersion,
       lastInitializedAt: lastInitializedAt,
       providerName: String(describing: type(of: embeddingProvider)),
       embeddingModelName: embeddingProvider.modelName,
@@ -290,6 +304,8 @@ public actor RAGStore {
     if let handle = db {
       sqlite3_close(handle)
       db = nil
+      extensionLoaded = false
+      extensionVersion = nil
     }
   }
 

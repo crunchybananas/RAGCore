@@ -374,6 +374,16 @@ extension RAGStore {
   }
 
   internal func upsertEmbedding(chunkId: String, vector: [Float]) throws {
+    guard !vector.isEmpty else {
+      throw RAGError.embeddingFailed("Cannot store an empty embedding")
+    }
+    let configuredDimensions = embeddingProvider.dimensions
+    guard configuredDimensions == 0 || configuredDimensions == vector.count else {
+      throw RAGError.embeddingFailed(
+        "Embedding has \(vector.count) dimensions; provider declares \(configuredDimensions)"
+      )
+    }
+
     let sql = "INSERT OR REPLACE INTO embeddings (chunk_id, embedding) VALUES (?, ?)"
     let data = VectorMath.encodeVector(vector)
     try execute(sql: sql) { stmt in
@@ -383,14 +393,22 @@ extension RAGStore {
       }
     }
     if extensionLoaded {
+      try ensureVecTable(dimensions: vector.count)
       let deleteSql = "DELETE FROM vec_chunks WHERE chunk_id = ?"
       try execute(sql: deleteSql) { stmt in bindText(stmt, 1, chunkId) }
-      let vecSql = "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)"
+      let vecSql = """
+        INSERT INTO vec_chunks (chunk_id, repo_id, embedding)
+        SELECT ?, f.repo_id, ?
+        FROM chunks c
+        JOIN files f ON f.id = c.file_id
+        WHERE c.id = ?
+        """
       try execute(sql: vecSql) { stmt in
         bindText(stmt, 1, chunkId)
         _ = data.withUnsafeBytes { bytes in
           sqlite3_bind_blob(stmt, 2, bytes.baseAddress, Int32(data.count), sqliteTransient)
         }
+        bindText(stmt, 3, chunkId)
       }
     }
   }
