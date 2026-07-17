@@ -54,8 +54,9 @@ struct SchemaSelfHealTests {
     // Simulate the broken fleet shape: high schema_version, no join indexes.
     for name in Self.coreJoinIndexes {
       try await store.exec("DROP INDEX \(name)")
-      #expect(try await !indexExists(store, name: name), "expected \(name) dropped")
+      #expect(try await indexExists(store, name: name) == false, "expected \(name) dropped")
     }
+    await store.closeDatabase()
 
     // A plain reopen must heal the indexes without touching the version.
     let reopened = makeStore(databaseURL: databaseURL)
@@ -65,5 +66,6 @@ struct SchemaSelfHealTests {
       #expect(try await indexExists(reopened, name: name), "expected \(name) healed on reopen")
     }
     #expect(try await schemaVersion(reopened) == migratedVersion)
+    await reopened.closeDatabase()
   }
 }
