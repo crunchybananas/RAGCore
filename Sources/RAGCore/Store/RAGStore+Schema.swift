@@ -2,7 +2,7 @@
 //  RAGStore+Schema.swift
 //  RAGCore
 //
-//  Schema management and migrations (v1→v17).
+//  Schema management and migrations (v1→v18).
 //
 
 import CSQLite
@@ -132,9 +132,9 @@ extension RAGStore {
     }
 
     if schemaVersion < 2 {
-      try exec("CREATE INDEX IF NOT EXISTS idx_files_repo ON files(repo_id)")
-      try exec("CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id)")
-      try exec("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash)")
+      // v2 introduced the core join indexes. They are asserted unconditionally
+      // after the migration chain (ensureCoreJoinIndexes), so this gate only
+      // records the version.
       try setSchemaVersion(2)
     }
 
@@ -459,10 +459,26 @@ extension RAGStore {
       try setSchemaVersion(18)
     }
 
+    // Deliberately outside the version gates: a database can reach a high
+    // schema_version without these indexes — table-rebuild migrations drop
+    // secondary indexes, and sync-imported databases arrive with full-shape
+    // tables plus a stamped version, so the v2 gate never fires. Without them
+    // every files↔chunks join degenerates to a full scan.
+    try ensureCoreJoinIndexes()
+
     // Unknown-model providers learn their dimensions after the first embed.
     if extensionLoaded && embeddingProvider.dimensions > 0 {
       try ensureVecTable()
     }
+  }
+
+  /// Re-assert the core join indexes that files↔chunks queries depend on.
+  /// Idempotent and catalog-cheap when the indexes already exist; heals
+  /// databases whose migration history or import path lost them.
+  internal func ensureCoreJoinIndexes() throws {
+    try exec("CREATE INDEX IF NOT EXISTS idx_files_repo ON files(repo_id)")
+    try exec("CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id)")
+    try exec("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash)")
   }
 
   internal func ensureVecTable(dimensions explicitDimensions: Int? = nil) throws {
