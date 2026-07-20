@@ -897,4 +897,129 @@ extension RAGStore {
       bindText(stmt, 6, source)
     }
   }
+
+  // MARK: - Analyzer Pin
+
+  /// How one repository's analysis is distributed across analyzer models.
+  ///
+  /// The distinction that matters: `pinnedModel` is what this corpus is
+  /// *supposed* to be analyzed with; `coverage` is what it actually is. A
+  /// corpus whose chunks were each analyzed once, by whatever model happened
+  /// to be configured that day, reads as one repository but behaves like
+  /// several — summaries of very different quality ranked against each other
+  /// as equals, and no amount of re-running analysis converges it.
+  public struct AnalyzerDriftSummary: Sendable, Equatable {
+    /// The repo's analyzer pin; nil when unpinned.
+    public let pinnedModel: String?
+    /// Chunk count per analyzer model, descending. Excludes failures.
+    public let coverage: [ModelCount]
+    /// Chunks analyzed by a model other than the pin. Zero when unpinned.
+    public let offPinChunks: Int
+    /// Chunks whose analysis failed. Counted separately because they are
+    /// recorded under a pseudo-model and otherwise inflate "analyzed".
+    public let failedChunks: Int
+    /// Chunks with no analysis at all.
+    public let unanalyzedChunks: Int
+
+    public struct ModelCount: Sendable, Equatable {
+      public let model: String
+      public let count: Int
+      public init(model: String, count: Int) {
+        self.model = model
+        self.count = count
+      }
+    }
+
+    /// True when the corpus is a blend rather than one analyzer's work.
+    public var isDrifted: Bool { coverage.count > 1 }
+  }
+
+  /// Read a repository's analyzer pin. nil when unpinned.
+  public func repoAnalyzerModel(repoPath: String) throws -> String? {
+    try openIfNeeded()
+    try ensureSchema()
+    let repoId = try resolveRepoId(for: repoPath)
+    guard let db else { throw RAGError.sqlite("Database not initialized") }
+
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(db, "SELECT analyzer_model FROM repos WHERE id = ?", -1, &statement, nil) == SQLITE_OK,
+          let statement else {
+      throw RAGError.sqlite(String(cString: sqlite3_errmsg(db)))
+    }
+    defer { sqlite3_finalize(statement) }
+    bindText(statement, 1, repoId)
+    guard sqlite3_step(statement) == SQLITE_ROW,
+          let raw = sqlite3_column_text(statement, 0) else { return nil }
+    let value = String(cString: raw).trimmingCharacters(in: .whitespacesAndNewlines)
+    return value.isEmpty ? nil : value
+  }
+
+  /// Pin a repository to an analyzer model, or pass nil to unpin.
+  ///
+  /// Setting the pin declares intent; it re-analyzes nothing. Read
+  /// `analyzerDrift` to see the gap it exposes.
+  public func setRepoAnalyzerModel(repoPath: String, model: String?) throws {
+    try openIfNeeded()
+    try ensureSchema()
+    let repoId = try resolveRepoId(for: repoPath)
+    let normalized = model?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let resolved = (normalized?.isEmpty ?? true) ? nil : normalized
+    try execute(sql: "UPDATE repos SET analyzer_model = ? WHERE id = ?") { stmt in
+      self.bindTextOrNull(stmt, 1, resolved)
+      self.bindText(stmt, 2, repoId)
+    }
+  }
+
+  /// What this corpus was actually analyzed with, versus what it is pinned to.
+  public func analyzerDrift(repoPath: String) throws -> AnalyzerDriftSummary {
+    try openIfNeeded()
+    try ensureSchema()
+    let repoId = try resolveRepoId(for: repoPath)
+    let pin = try repoAnalyzerModel(repoPath: repoPath)
+    guard let db else { throw RAGError.sqlite("Database not initialized") }
+
+    var coverage: [AnalyzerDriftSummary.ModelCount] = []
+    var failed = 0
+    let sql = """
+      SELECT COALESCE(c.analyzer_model, 'unknown'), COUNT(*)
+      FROM chunks c JOIN files f ON c.file_id = f.id
+      WHERE f.repo_id = ? AND c.ai_summary IS NOT NULL
+      GROUP BY 1 ORDER BY 2 DESC
+      """
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+      throw RAGError.sqlite(String(cString: sqlite3_errmsg(db)))
+    }
+    defer { sqlite3_finalize(statement) }
+    bindText(statement, 1, repoId)
+    while sqlite3_step(statement) == SQLITE_ROW {
+      let model = String(cString: sqlite3_column_text(statement, 0))
+      let count = Int(sqlite3_column_int(statement, 1))
+      // Failures are recorded under a pseudo-model. Reporting them as if they
+      // were an analyzer is what makes "analyzed" read higher than the usable
+      // analysis actually present.
+      if model == Self.failedAnalysisModel {
+        failed += count
+      } else {
+        coverage.append(.init(model: model, count: count))
+      }
+    }
+
+    let offPin = pin.map { pinned in
+      coverage.filter { $0.model != pinned }.reduce(0) { $0 + $1.count }
+    } ?? 0
+
+    let unanalyzed = try queryInt("""
+      SELECT COUNT(*) FROM chunks c JOIN files f ON c.file_id = f.id
+      WHERE f.repo_id = ? AND c.ai_summary IS NULL
+      """) { stmt in self.bindText(stmt, 1, repoId) }
+
+    return AnalyzerDriftSummary(
+      pinnedModel: pin,
+      coverage: coverage,
+      offPinChunks: offPin,
+      failedChunks: failed,
+      unanalyzedChunks: unanalyzed
+    )
+  }
 }
