@@ -459,6 +459,23 @@ extension RAGStore {
       try setSchemaVersion(18)
     }
 
+    if schemaVersion < 19 {
+      // Per-repo analyzer pin: the model whose analysis is authoritative for
+      // this corpus. Mirrors `embedding_model` (v14) deliberately — same
+      // shape, same lifecycle, and it rides the same repo-level manifest
+      // through overlay sync, so a peer pulling a corpus inherits which
+      // analyzer it was built with instead of extending it with whatever
+      // model that peer happens to have configured.
+      //
+      // Nullable on purpose: an unpinned repo keeps today's behavior. The pin
+      // is a statement about one corpus, not a fleet-wide mandate — different
+      // repos may legitimately want different analyzers.
+      if !columnExists("repos", column: "analyzer_model") {
+        try exec("ALTER TABLE repos ADD COLUMN analyzer_model TEXT")
+      }
+      try setSchemaVersion(19)
+    }
+
     // Deliberately outside the version gates: a database can reach a high
     // schema_version without these indexes — table-rebuild migrations drop
     // secondary indexes, and sync-imported databases arrive with full-shape

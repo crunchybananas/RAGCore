@@ -98,6 +98,10 @@ public actor RAGStore {
     public let embeddingModel: String?
     /// The dimensionality of stored embeddings (e.g. 768).
     public let embeddingDimensions: Int?
+    /// The analyzer this corpus is pinned to; nil when unpinned. This is the
+    /// declared intent — what the chunks were *actually* analyzed with can
+    /// differ, and `analyzerDrift(repoPath:)` reports the gap.
+    public let analyzerModel: String?
   }
 
   public struct ChunkingHealthInfo: Sendable {
@@ -321,7 +325,8 @@ public actor RAGStore {
              r.repo_identifier,
              r.parent_repo_id,
              r.embedding_model,
-             r.embedding_dimensions
+             r.embedding_dimensions,
+             r.analyzer_model
       FROM repos r
       ORDER BY r.name
       """
@@ -352,12 +357,14 @@ public actor RAGStore {
       let embeddingModel = sqlite3_column_text(statement, 8).map { String(cString: $0) }
       let embeddingDimensions: Int? = sqlite3_column_type(statement, 9) != SQLITE_NULL
         ? Int(sqlite3_column_int(statement, 9)) : nil
+      let analyzerModel = sqlite3_column_text(statement, 10).map { String(cString: $0) }
 
       repos.append(RepoInfo(
         id: id, name: name, rootPath: rootPath, lastIndexedAt: lastIndexedAt,
         fileCount: fileCount, chunkCount: chunkCount,
         repoIdentifier: repoIdentifier, parentRepoId: parentRepoId,
-        embeddingModel: embeddingModel, embeddingDimensions: embeddingDimensions
+        embeddingModel: embeddingModel, embeddingDimensions: embeddingDimensions,
+        analyzerModel: analyzerModel
       ))
     }
     return repos
