@@ -2,7 +2,7 @@
 //  RAGStore+Schema.swift
 //  RAGCore
 //
-//  Schema management and migrations (v1→v18).
+//  Schema management and migrations (v1→v20).
 //
 
 import CSQLite
@@ -474,6 +474,28 @@ extension RAGStore {
         try exec("ALTER TABLE repos ADD COLUMN analyzer_model TEXT")
       }
       try setSchemaVersion(19)
+    }
+
+    if schemaVersion < 20 {
+      // Referential integrity for bridged lessons (cloke/peel#1766).
+      //
+      // A chain learning is mirrored into this table so it stays queryable by
+      // file pattern, but the mirror carried no reference back to its origin —
+      // its id is content-addressed. Deleting the origin therefore could not
+      // find the mirror, so callers matched on a reconstructed
+      // `fixDescription` instead. Content matching fails quietly on an edited
+      // summary, on one summary that is a prefix of another, and on
+      // near-duplicates: retracting a learning left its mirror in place, still
+      // being served as current.
+      //
+      // Nullable: lessons authored directly have no origin, and rows written
+      // before this migration keep nil — which is what the caller's legacy
+      // content-match fallback exists to cover.
+      if !columnExists("lessons", column: "source_learning_id") {
+        try exec("ALTER TABLE lessons ADD COLUMN source_learning_id TEXT")
+      }
+      try exec("CREATE INDEX IF NOT EXISTS idx_lessons_source_learning ON lessons(source_learning_id)")
+      try setSchemaVersion(20)
     }
 
     // Deliberately outside the version gates: a database can reach a high

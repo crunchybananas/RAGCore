@@ -19,7 +19,8 @@ extension RAGStore {
     errorSignature: String? = nil,
     fixDescription: String,
     fixCode: String? = nil,
-    source: String = "manual"
+    source: String = "manual",
+    sourceLearningId: String? = nil
   ) throws -> RAGLesson {
     try openIfNeeded()
     try ensureSchema()
@@ -29,8 +30,8 @@ extension RAGStore {
     let now = dateFormatter.string(from: Date())
 
     let sql = """
-      INSERT INTO lessons (id, repo_id, error_signature, file_pattern, fix_description, fix_code, source, confidence, is_active, created_at, updated_at, apply_count, success_count)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 1.0, 1, ?, ?, 0, 0)
+      INSERT INTO lessons (id, repo_id, error_signature, file_pattern, fix_description, fix_code, source, confidence, is_active, created_at, updated_at, apply_count, success_count, source_learning_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 1.0, 1, ?, ?, 0, 0, ?)
       """
     try execute(sql: sql) { stmt in
       bindText(stmt, 1, lessonId)
@@ -42,6 +43,7 @@ extension RAGStore {
       bindText(stmt, 7, source)
       bindText(stmt, 8, now)
       bindText(stmt, 9, now)
+      bindTextOrNull(stmt, 10, sourceLearningId)
     }
 
     return RAGLesson(
@@ -285,4 +287,33 @@ extension RAGStore {
       applyCount: applyCount, successCount: successCount
     )
   }
+
+  /// Delete every lesson bridged from a given chain learning.
+  ///
+  /// This is the reason `source_learning_id` exists (cloke/peel#1766): a
+  /// learning's mirror here is content-addressed, so before the back-reference
+  /// the only way to find it was to reconstruct its `fixDescription` and match
+  /// on text. That silently missed edited summaries and near-duplicates, and
+  /// left retracted learnings being served as current. Deleting by origin is
+  /// exact.
+  ///
+  /// Returns the number of lessons removed — 0 is a legitimate answer for a
+  /// learning that was never bridged (only `.repository` scope is), and for
+  /// rows written before the back-reference existed. Callers that must cover
+  /// those fall back to content matching.
+  @discardableResult
+  public func deleteLessons(sourceLearningId: String) throws -> Int {
+    try openIfNeeded()
+    try ensureSchema()
+
+    let before = try queryInt("SELECT COUNT(*) FROM lessons WHERE source_learning_id = ?") { stmt in
+      self.bindText(stmt, 1, sourceLearningId)
+    }
+    guard before > 0 else { return 0 }
+    try execute(sql: "DELETE FROM lessons WHERE source_learning_id = ?") { stmt in
+      self.bindText(stmt, 1, sourceLearningId)
+    }
+    return before
+  }
+
 }
