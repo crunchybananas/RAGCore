@@ -301,21 +301,33 @@ extension RAGStore {
     guard !chunks.isEmpty else { return 0 }
 
     let enrichedTexts = chunks.map { "\($0.text)\n\n// AI Summary: \($0.aiSummary)" }
-    let batchSize = 32
     var enrichedCount = 0
     let now = dateFormatter.string(from: Date())
 
-    for batchStart in stride(from: 0, to: chunks.count, by: batchSize) {
-      let batchEnd = min(batchStart + batchSize, chunks.count)
-      let batchTexts = Array(enrichedTexts[batchStart..<batchEnd])
-      let batchChunks = Array(chunks[batchStart..<batchEnd])
+    for range in Self.embedBatchRanges(for: enrichedTexts) {
+      let batchTexts = Array(enrichedTexts[range])
+      let batchChunks = Array(chunks[range])
 
-      progress?(batchStart, chunks.count)
+      progress?(range.lowerBound, chunks.count)
 
-      let embeddings = try await embeddingProvider.embed(texts: batchTexts)
+      // A batch that fails takes nobody down with it: retry its members one at
+      // a time so a single unembeddable chunk can't strand the rest. Without
+      // this the throw escaped `enrichEmbeddings` entirely and — because the
+      // select is a bare LIMIT with no cursor — the very same batch came back
+      // next run, forever. tio-api sat at 5485/6484 permanently that way.
+      var embeddings = await embed(batchTexts, describedAs: "batch of \(batchTexts.count)")
+      if embeddings == nil {
+        embeddings = []
+        for (offset, text) in batchTexts.enumerated() {
+          let single = await embed([text], describedAs: "chunk \(batchChunks[offset].id)")
+          // Keep positions aligned with batchChunks — an empty vector is
+          // skipped by the writer below, same as a provider returning one.
+          embeddings?.append(single?.first ?? [])
+        }
+      }
 
-      for (offset, vector) in embeddings.enumerated() {
-        guard !vector.isEmpty else { continue }
+      for (offset, vector) in (embeddings ?? []).enumerated() {
+        guard !vector.isEmpty, offset < batchChunks.count else { continue }
         let chunk = batchChunks[offset]
         try upsertEmbedding(chunkId: chunk.id, vector: vector)
         try execute(sql: "UPDATE chunks SET enriched_at = ? WHERE id = ?") { stmt in
@@ -332,6 +344,56 @@ extension RAGStore {
     }
 
     return enrichedCount
+  }
+
+  /// One embed call, nil on failure. Errors are logged and swallowed so the
+  /// caller can degrade (batch → singles) instead of aborting the whole pass.
+  private func embed(_ texts: [String], describedAs label: String) async -> [[Float]]? {
+    do {
+      return try await embeddingProvider.embed(texts: texts)
+    } catch {
+      print("[RAG] Embedding failed for \(label): \(error)")
+      return nil
+    }
+  }
+
+  /// Largest total payload we'll put in one embed request, in UTF-8 bytes.
+  ///
+  /// Sized against the failure this exists to prevent: llama.cpp-backed
+  /// embedding servers (ollama ≤ 0.31.x among them) kill the model runner
+  /// mid-request on an oversized batch, surfacing as a connection EOF rather
+  /// than a clean 4xx — so there's nothing to retry against. Measured on
+  /// qwen3-embedding:0.6b, a 161 KB request killed the runner every time while
+  /// the same chunks sent individually all succeeded; failures started
+  /// appearing intermittently around 40 KB. 32 KB keeps a margin under that.
+  static let maxEmbedBatchBytes = 32_000
+
+  /// Upper bound on batch *count*, independent of size — a batch of thousands
+  /// of tiny chunks is its own kind of trouble.
+  static let maxEmbedBatchCount = 32
+
+  /// Split `texts` into contiguous ranges that respect both caps. A single text
+  /// over the byte cap gets a range to itself rather than being dropped or
+  /// truncated: oversized-but-alone is exactly the shape that empirically
+  /// still succeeds, and silently mangling a chunk's embedding is worse than
+  /// one risky request.
+  static func embedBatchRanges(for texts: [String]) -> [Range<Int>] {
+    var ranges: [Range<Int>] = []
+    var start = 0
+    var bytes = 0
+    for index in texts.indices {
+      let size = texts[index].utf8.count
+      let wouldExceedBytes = bytes > 0 && bytes + size > maxEmbedBatchBytes
+      let wouldExceedCount = index - start >= maxEmbedBatchCount
+      if wouldExceedBytes || wouldExceedCount {
+        ranges.append(start..<index)
+        start = index
+        bytes = 0
+      }
+      bytes += size
+    }
+    if start < texts.count { ranges.append(start..<texts.count) }
+    return ranges
   }
 
   /// Get count of un-enriched chunks (analyzed but not yet re-embedded).
