@@ -106,7 +106,16 @@ public struct RAGFileScanner: Sendable {
     for case let fileURL as URL in enumerator {
       try cancellationCheck()
       if shouldSkip(url: fileURL, rootURL: rootURL, ignorePatterns: ignorePatterns, excludedRoots: excludingRoots) {
-        enumerator.skipDescendants()
+        // `skipDescendants()` is only valid for a directory. Calling it after
+        // an ignored file (for example `poetry.lock`) makes Foundation skip
+        // the file's later siblings too, which can silently prune an entire
+        // source directory from the scan.
+        let isDirectory = (try? fileURL.resourceValues(
+          forKeys: [.isDirectoryKey]
+        ).isDirectory) == true
+        if isDirectory {
+          enumerator.skipDescendants()
+        }
         continue
       }
 
