@@ -18,6 +18,20 @@ public struct OllamaEmbeddingCircuitOpenError: LocalizedError, Sendable {
   public let consecutiveFailures: Int
   public let openedNow: Bool
 
+  public init(
+    endpoint: String,
+    model: String,
+    retryAfter: Date,
+    consecutiveFailures: Int,
+    openedNow: Bool
+  ) {
+    self.endpoint = endpoint
+    self.model = model
+    self.retryAfter = retryAfter
+    self.consecutiveFailures = consecutiveFailures
+    self.openedNow = openedNow
+  }
+
   public var errorDescription: String? {
     let retry = ISO8601DateFormatter().string(from: retryAfter)
     return "Ollama embedding circuit is open for \(model) at \(endpoint) after "
