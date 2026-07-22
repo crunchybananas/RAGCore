@@ -70,6 +70,28 @@ public struct RAGFileScanner: Sendable {
   ///   - excludingRoots: Absolute paths to skip entirely (e.g. sub-repo roots).
   /// - Returns: Array of file candidates with their paths, sizes, and languages.
   public func scan(rootURL: URL, excludingRoots: [String] = []) -> [RAGFileCandidate] {
+    scan(rootURL: rootURL, excludingRoots: excludingRoots, cancellationCheck: {})
+  }
+
+  /// Scan while cooperatively honoring cancellation between filesystem entries.
+  ///
+  /// Kept internal because the public non-throwing API predates cancellation.
+  /// Indexing uses this path so a cancelled task does not finish walking a large
+  /// repository before it can stop.
+  internal func scanCancellable(rootURL: URL, excludingRoots: [String] = []) throws -> [RAGFileCandidate] {
+    try scan(
+      rootURL: rootURL,
+      excludingRoots: excludingRoots,
+      cancellationCheck: { try Task.checkCancellation() }
+    )
+  }
+
+  private func scan(
+    rootURL: URL,
+    excludingRoots: [String],
+    cancellationCheck: () throws -> Void
+  ) rethrows -> [RAGFileCandidate] {
+    try cancellationCheck()
     guard let enumerator = FileManager.default.enumerator(
       at: rootURL,
       includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
@@ -82,6 +104,7 @@ public struct RAGFileScanner: Sendable {
     var results: [RAGFileCandidate] = []
 
     for case let fileURL as URL in enumerator {
+      try cancellationCheck()
       if shouldSkip(url: fileURL, rootURL: rootURL, ignorePatterns: ignorePatterns, excludedRoots: excludingRoots) {
         enumerator.skipDescendants()
         continue

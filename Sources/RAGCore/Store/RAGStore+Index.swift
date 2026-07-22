@@ -33,11 +33,14 @@ extension RAGStore {
     progress: RAGProgressCallback?
   ) async throws -> RAGIndexReport {
     let startTime = Date()
+    try Task.checkCancellation()
     _ = try initialize()
+    try Task.checkCancellation()
     logMemory("index start")
 
     let repoURL = URL(fileURLWithPath: path)
-    let workspaceRepos = detectWorkspaceRepos(rootURL: repoURL)
+    let workspaceRepos = try detectWorkspaceReposCancellable(rootURL: repoURL)
+    try Task.checkCancellation()
 
     // Workspace auto-indexing: only split into sub-indexes when multiple
     // separate git repos are detected (e.g., a workspace folder containing
@@ -45,7 +48,7 @@ extension RAGStore {
     // package.json, Package.swift, etc.) should NOT cause splitting — those
     // are part of the same codebase and belong in one index.
     if workspaceRepos.count >= 2 && !allowWorkspace {
-      let subPackages = detectSubPackages(rootURL: repoURL, excludingGitRepos: workspaceRepos)
+      let subPackages = try detectSubPackagesCancellable(rootURL: repoURL, excludingGitRepos: workspaceRepos)
       let allSubPaths = workspaceRepos + subPackages
       let parentRepoId: String
       if let resolved = try resolveRepo(for: path, remapRootPathOnMismatch: true) {
@@ -75,6 +78,7 @@ extension RAGStore {
 
       print("[RAG] Workspace detected at \(path): auto-indexing \(allSubPaths.count) sub-packages")
       for (idx, subPath) in allSubPaths.enumerated() {
+        try Task.checkCancellation()
         let subURL = URL(fileURLWithPath: subPath)
         let subRepoId: String
         if let resolved = try resolveRepo(for: subPath, remapRootPathOnMismatch: true) {
@@ -105,6 +109,7 @@ extension RAGStore {
           excludeSubrepos: true,
           progress: progress
         )
+        try Task.checkCancellation()
         subReports.append(subReport)
         totalFiles += subReport.filesIndexed
         totalSkipped += subReport.filesSkipped
@@ -119,6 +124,7 @@ extension RAGStore {
       }
 
       let durationMs = Int(Date().timeIntervalSince(startTime) * 1000)
+      try Task.checkCancellation()
       let report = RAGIndexReport(
         repoId: parentRepoId,
         repoPath: path,
@@ -142,7 +148,8 @@ extension RAGStore {
     // Single repo — index normally
     let excludedRoots = (allowWorkspace && excludeSubrepos) ? workspaceRepos : []
     let effectiveScanner = excludedDirectories.map { RAGFileScanner(excludedDirectories: $0) } ?? scanner
-    let scannedFiles = effectiveScanner.scan(rootURL: repoURL, excludingRoots: excludedRoots)
+    let scannedFiles = try effectiveScanner.scanCancellable(rootURL: repoURL, excludingRoots: excludedRoots)
+    try Task.checkCancellation()
     logMemory("after scan \(scannedFiles.count) files")
     progress?(.scanning(fileCount: scannedFiles.count))
 
@@ -205,6 +212,7 @@ extension RAGStore {
     var lastEmbeddingProgressTime = Date.distantPast
 
     for (fileIndex, candidate) in scannedFiles.enumerated() {
+      try Task.checkCancellation()
       if fileIndex % progressInterval == 0 {
         progress?(.analyzing(current: fileIndex + 1, total: scannedFiles.count, fileName: URL(fileURLWithPath: candidate.path).lastPathComponent))
       }
@@ -219,10 +227,12 @@ extension RAGStore {
           seenTextHashes.removeAll()
           await memoryMonitor.clearCaches()
           try await Task.sleep(for: .milliseconds(500))
+          try Task.checkCancellation()
         }
       }
 
       guard let file = effectiveScanner.loadFile(candidate: candidate) else { continue }
+      try Task.checkCancellation()
 
       let relativePath = file.path.hasPrefix(path + "/")
         ? String(file.path.dropFirst(path.count + 1))
@@ -248,6 +258,7 @@ extension RAGStore {
         fileHash: fileHash,
         healthTracker: healthTracker
       )
+      try Task.checkCancellation()
 
       if chunkResult.usedAST { astFilesChunked += 1 } else { lineFilesChunked += 1 }
 
@@ -272,6 +283,7 @@ extension RAGStore {
       // Find missing embeddings
       var missingEmbeddings: [MissingEmbedding] = []
       for (index, textHash) in chunkHashes.enumerated() {
+        try Task.checkCancellation()
         if !seenTextHashes.contains(textHash) {
           let cached = try fetchCachedEmbedding(textHash: textHash)
           if cached == nil {
@@ -286,6 +298,7 @@ extension RAGStore {
         var aborted = false
 
         batchLoop: for batchStart in stride(from: 0, to: missingEmbeddings.count, by: embeddingBatchSize) {
+          try Task.checkCancellation()
           let batchEnd = min(batchStart + embeddingBatchSize, missingEmbeddings.count)
           let batchTexts = missingEmbeddings[batchStart..<batchEnd].map(\.text)
 
@@ -293,6 +306,9 @@ extension RAGStore {
           do {
             batchEmbeddings = try await embeddingProvider.embed(texts: batchTexts)
           } catch {
+            if error is CancellationError || Task.isCancelled {
+              throw CancellationError()
+            }
             // Likely transport (Ollama offline) or rate-limit. Latch
             // embeddings off for the rest of the run, log once, and let
             // the caller see chunks/symbols still get persisted. The
@@ -306,9 +322,11 @@ extension RAGStore {
             aborted = true
             break batchLoop
           }
+          try Task.checkCancellation()
           embeddingCount += batchEmbeddings.count
 
           for (offset, vector) in batchEmbeddings.enumerated() {
+            try Task.checkCancellation()
             let missing = missingEmbeddings[batchStart + offset]
             embeddingCache[missing.textHash] = vector
             if !vector.isEmpty {
@@ -326,8 +344,10 @@ extension RAGStore {
           // Clear caches after each batch to prevent memory accumulation
           if let batchAware = embeddingProvider as? BatchAwareEmbeddingProvider {
             await batchAware.didCompleteBatch()
+            try Task.checkCancellation()
           }
           await memoryMonitor.clearCaches()
+          try Task.checkCancellation()
         }
 
         let embedDuration = Int(Date().timeIntervalSince(embedStart) * 1000)
@@ -347,6 +367,7 @@ extension RAGStore {
       if filesIndexed % progressInterval == 0 {
         progress?(.storing(current: filesIndexed + 1, total: scannedFiles.count))
       }
+      try Task.checkCancellation()
 
       let modulePath = extractModulePath(from: relativePath)
       let featureTags = extractFeatureTags(from: relativePath, language: file.language, chunks: chunks)
@@ -371,6 +392,7 @@ extension RAGStore {
       try deleteSymbols(for: fileId)
 
       for (index, chunk) in chunks.enumerated() {
+        try Task.checkCancellation()
         let chunkId = VectorMath.stableId(for: "\(fileId):\(chunk.startLine):\(chunk.endLine):\(chunk.text)")
         let textHash = chunkHashes[index]
         let cachedAnalysis = try fetchCachedAIAnalysis(textHash: textHash)
@@ -399,6 +421,7 @@ extension RAGStore {
       }
 
       // Dependencies and symbol refs
+      try Task.checkCancellation()
       let fileDeps = extractDependencies(
         from: chunks, repoId: repoId, fileId: fileId,
         relativePath: relativePath, language: file.language
@@ -424,6 +447,7 @@ extension RAGStore {
     print("[RAG] AST stats: \(astFilesChunked) AST, \(lineFilesChunked) line-based, \(chunkingFailures) failures")
 
     // Prune files from the index that no longer exist on disk
+    try Task.checkCancellation()
     let currentPaths = Set(scannedFiles.map { file -> String in
       let filePath = file.path
       return filePath.hasPrefix(path + "/")
@@ -431,6 +455,7 @@ extension RAGStore {
         : filePath
     })
     let filesRemovedCount = try pruneDeletedFiles(repoId: repoId, currentPaths: currentPaths)
+    try Task.checkCancellation()
     if filesRemovedCount > 0 {
       print("[RAG] Pruned \(filesRemovedCount) deleted files from index")
     }
@@ -479,6 +504,7 @@ extension RAGStore {
 
     var staleFiles: [(id: String, path: String)] = []
     while sqlite3_step(statement) == SQLITE_ROW {
+      try Task.checkCancellation()
       guard let idPtr = sqlite3_column_text(statement, 0),
             let pathPtr = sqlite3_column_text(statement, 1) else { continue }
       let fileId = String(cString: idPtr)
@@ -491,6 +517,7 @@ extension RAGStore {
     guard !staleFiles.isEmpty else { return 0 }
 
     for staleFile in staleFiles {
+      try Task.checkCancellation()
       // vec_chunks first (virtual table — no CASCADE)
       if extensionLoaded {
         let vecSql = "DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = ?)"

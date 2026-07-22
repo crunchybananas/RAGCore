@@ -583,6 +583,21 @@ public actor RAGStore {
   }
 
   internal func detectWorkspaceRepos(rootURL: URL) -> [String] {
+    detectWorkspaceRepos(rootURL: rootURL, cancellationCheck: {})
+  }
+
+  internal func detectWorkspaceReposCancellable(rootURL: URL) throws -> [String] {
+    try detectWorkspaceRepos(
+      rootURL: rootURL,
+      cancellationCheck: { try Task.checkCancellation() }
+    )
+  }
+
+  private func detectWorkspaceRepos(
+    rootURL: URL,
+    cancellationCheck: () throws -> Void
+  ) rethrows -> [String] {
+    try cancellationCheck()
     let resolvedRoot = rootURL.resolvingSymlinksInPath()
     guard let enumerator = FileManager.default.enumerator(
       at: resolvedRoot,
@@ -597,6 +612,7 @@ public actor RAGStore {
     var repos: [String] = []
 
     for case let url as URL in enumerator {
+      try cancellationCheck()
       let depth = url.pathComponents.count - baseDepth
       if depth <= 0 { continue }
       if depth > 4 { enumerator.skipDescendants(); continue }
@@ -616,6 +632,23 @@ public actor RAGStore {
   }
 
   internal func detectSubPackages(rootURL: URL, excludingGitRepos gitRepos: [String]) -> [String] {
+    detectSubPackages(rootURL: rootURL, excludingGitRepos: gitRepos, cancellationCheck: {})
+  }
+
+  internal func detectSubPackagesCancellable(rootURL: URL, excludingGitRepos gitRepos: [String]) throws -> [String] {
+    try detectSubPackages(
+      rootURL: rootURL,
+      excludingGitRepos: gitRepos,
+      cancellationCheck: { try Task.checkCancellation() }
+    )
+  }
+
+  private func detectSubPackages(
+    rootURL: URL,
+    excludingGitRepos gitRepos: [String],
+    cancellationCheck: () throws -> Void
+  ) rethrows -> [String] {
+    try cancellationCheck()
     let resolvedRoot = rootURL.resolvingSymlinksInPath()
     guard let enumerator = FileManager.default.enumerator(
       at: resolvedRoot,
@@ -632,6 +665,7 @@ public actor RAGStore {
     let gitRepoSet = Set(gitRepos)
 
     for case let url as URL in enumerator {
+      try cancellationCheck()
       let depth = url.pathComponents.count - baseDepth
       if depth <= 0 { continue }
       if depth > 4 { enumerator.skipDescendants(); continue }
