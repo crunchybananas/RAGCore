@@ -10,6 +10,34 @@ import Foundation
 
 extension RAGStore {
 
+  /// Sub-repo roots a flat-workspace scan must skip.
+  ///
+  /// `excludeSubrepos: false` asks for a flat workspace index, which is a
+  /// legitimate request only for sub-repos nobody indexes separately. Walking a
+  /// checkout that ALREADY has its own row duplicates it outright: same bytes,
+  /// same embeddings, two rows, and every search hit inside it returned twice.
+  /// Observed on a superproject with 13 submodules — 5,479 of 7,732 files had a
+  /// byte-identical twin, and the parent's 21,551 chunks were almost entirely
+  /// redundant with the children's.
+  ///
+  /// So the flag governs UNTRACKED sub-repos only. A tracked one is always
+  /// excluded, which makes the duplicate structurally unreachable rather than
+  /// contingent on every caller passing the right flag.
+  ///
+  /// The tracked filter applies when `allowWorkspace` is false too, which closes
+  /// a second, quieter case: the workspace split only fires at two or more
+  /// sub-repos, so a parent holding exactly ONE tracked child fell through to a
+  /// normal scan and absorbed it with no flag involved.
+  internal static func excludedSubrepoRoots(
+    workspaceRepos: [String],
+    allowWorkspace: Bool,
+    excludeSubrepos: Bool,
+    isTracked: (String) -> Bool
+  ) -> [String] {
+    if allowWorkspace && excludeSubrepos { return workspaceRepos }
+    return workspaceRepos.filter(isTracked)
+  }
+
   /// Index a repository without progress reporting.
   public func indexRepository(path: String) async throws -> RAGIndexReport {
     try await indexRepository(path: path, forceReindex: false, allowWorkspace: false, excludeSubrepos: true, progress: nil)
@@ -146,7 +174,14 @@ extension RAGStore {
     }
 
     // Single repo — index normally
-    let excludedRoots = (allowWorkspace && excludeSubrepos) ? workspaceRepos : []
+    let excludedRoots = Self.excludedSubrepoRoots(
+      workspaceRepos: workspaceRepos,
+      allowWorkspace: allowWorkspace,
+      excludeSubrepos: excludeSubrepos,
+      // remap stays off: this asks "does this path already have a row?", it must
+      // not rebind anything as a side effect (crunchybananas/RAGCore#2).
+      isTracked: { ((try? resolveRepo(for: $0)) ?? nil) != nil }
+    )
     let effectiveScanner = excludedDirectories.map { RAGFileScanner(excludedDirectories: $0) } ?? scanner
     let scannedFiles = try effectiveScanner.scanCancellable(rootURL: repoURL, excludingRoots: excludedRoots)
     try Task.checkCancellation()
