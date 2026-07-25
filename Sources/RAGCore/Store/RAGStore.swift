@@ -466,6 +466,106 @@ public actor RAGStore {
     return deletedFiles
   }
 
+  /// Delete only the files under given path prefixes, keeping the repo row and
+  /// everything else it holds.
+  ///
+  /// Exists for cleaning a superproject that an older indexer polluted with its
+  /// own submodules' content. `deleteRepo` is the wrong instrument there: the
+  /// superproject is a real repo with real files of its own (a README, CI
+  /// config, a `workspace/` tree), and dropping the whole row makes it vanish
+  /// from the repo list entirely and requires a full re-index to bring back.
+  /// This removes exactly the duplicated subtrees and leaves the rest intact,
+  /// so no re-index is needed to restore anything.
+  ///
+  /// Prefixes are matched against `files.path`, which is relative to the repo
+  /// root, and are LIKE-escaped so a directory containing `_` or `%` cannot
+  /// widen the match. A prefix is normalized to end in `/` so `api` cannot
+  /// match `apiary/…`.
+  ///
+  /// - Returns: Number of file rows removed.
+  @discardableResult
+  public func deleteFilesUnder(repoId: String, pathPrefixes: [String]) throws -> Int {
+    try openIfNeeded()
+    try ensureSchema()
+    guard let db else { throw RAGError.sqlite("Database not initialized") }
+
+    let normalized = pathPrefixes
+      .map { prefix -> String in
+        var trimmed = prefix
+        while trimmed.hasSuffix("/") { trimmed.removeLast() }
+        return trimmed
+      }
+      .filter { !$0.isEmpty }
+    guard !normalized.isEmpty else { return 0 }
+
+    // Escape LIKE metacharacters, then anchor to a directory boundary.
+    let patterns = normalized.map { prefix in
+      prefix
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "%", with: "\\%")
+        .replacingOccurrences(of: "_", with: "\\_")
+        + "/%"
+    }
+    let pathClause = patterns
+      .map { _ in "path LIKE ? ESCAPE '\\'" }
+      .joined(separator: " OR ")
+    // Every statement below scopes through this same set, so a file outside the
+    // prefixes is unreachable from any of them.
+    let targetFileIds = "SELECT id FROM files WHERE repo_id = ? AND (\(pathClause))"
+
+    func bind(_ stmt: OpaquePointer) {
+      sqlite3_bind_text(stmt, 1, repoId, -1, sqliteTransient)
+      for (index, pattern) in patterns.enumerated() {
+        sqlite3_bind_text(stmt, Int32(index + 2), pattern, -1, sqliteTransient)
+      }
+    }
+
+    func execScoped(_ sql: String, label: String) throws {
+      var stmt: OpaquePointer?
+      guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+        throw RAGError.sqlite("deleteFilesUnder \(label) prepare failed: \(String(cString: sqlite3_errmsg(db)))")
+      }
+      defer { sqlite3_finalize(stmt) }
+      bind(stmt)
+      guard sqlite3_step(stmt) == SQLITE_DONE else {
+        throw RAGError.sqlite("deleteFilesUnder \(label) failed: \(String(cString: sqlite3_errmsg(db)))")
+      }
+      print("[RAG] deleteFilesUnder: \(label) removed \(sqlite3_changes(db)) rows")
+    }
+
+    var doomedFiles = 0
+    var countStmt: OpaquePointer?
+    let countSQL = "SELECT COUNT(*) FROM files WHERE repo_id = ? AND (\(pathClause))"
+    if sqlite3_prepare_v2(db, countSQL, -1, &countStmt, nil) == SQLITE_OK, let countStmt {
+      bind(countStmt)
+      if sqlite3_step(countStmt) == SQLITE_ROW { doomedFiles = Int(sqlite3_column_int(countStmt, 0)) }
+      sqlite3_finalize(countStmt)
+    }
+    guard doomedFiles > 0 else { return 0 }
+
+    // Same order as deleteRepo: virtual table first (no CASCADE), then the
+    // chunk-keyed tables, then chunks, then files. The repo row survives.
+    if extensionLoaded {
+      try execScoped("""
+        DELETE FROM vec_chunks WHERE chunk_id IN (
+          SELECT c.id FROM chunks c WHERE c.file_id IN (\(targetFileIds))
+        )
+        """, label: "vec_chunks")
+    }
+    try execScoped("DELETE FROM dependencies WHERE source_file_id IN (\(targetFileIds))", label: "dependencies")
+    try execScoped("DELETE FROM symbol_refs WHERE source_file_id IN (\(targetFileIds))", label: "symbol_refs")
+    try execScoped("""
+      DELETE FROM embeddings WHERE chunk_id IN (
+        SELECT c.id FROM chunks c WHERE c.file_id IN (\(targetFileIds))
+      )
+      """, label: "embeddings")
+    try execScoped("DELETE FROM chunks WHERE file_id IN (\(targetFileIds))", label: "chunks")
+    try execScoped("DELETE FROM files WHERE repo_id = ? AND (\(pathClause))", label: "files")
+
+    print("[RAG] deleteFilesUnder: completed, \(doomedFiles) files removed from \(repoId)")
+    return doomedFiles
+  }
+
   /// Get chunking health info.
   public func getChunkingHealth() -> ChunkingHealthInfo {
     let failures = healthTracker.getFailures()
@@ -997,5 +1097,44 @@ public actor RAGStore {
     for table in ["files", "symbols", "dependencies", "lessons", "symbol_refs"] {
       try exec("UPDATE \(table) SET repo_id = '\(newId)' WHERE repo_id = '\(oldId)'")
     }
+  }
+}
+
+// MARK: - Test-only introspection
+
+extension RAGStore {
+  /// Every indexed path for one repo, sorted. Exists because there is no public
+  /// per-repo file listing and the deletion tests must assert on exact
+  /// survivors, not just counts.
+  public func testOnlyFilePaths(repoId: String) throws -> [String] {
+    try openIfNeeded()
+    guard let db else { throw RAGError.sqlite("Database not initialized") }
+    var stmt: OpaquePointer?
+    guard sqlite3_prepare_v2(db, "SELECT path FROM files WHERE repo_id = ? ORDER BY path", -1, &stmt, nil) == SQLITE_OK,
+          let stmt else {
+      throw RAGError.sqlite("testOnlyFilePaths prepare failed")
+    }
+    defer { sqlite3_finalize(stmt) }
+    sqlite3_bind_text(stmt, 1, repoId, -1, sqliteTransient)
+    var out: [String] = []
+    while sqlite3_step(stmt) == SQLITE_ROW {
+      if let ptr = sqlite3_column_text(stmt, 0) { out.append(String(cString: ptr)) }
+    }
+    return out
+  }
+
+  /// Chunks still reachable from one repo's files — catches rows orphaned by a
+  /// partial delete.
+  public func testOnlyChunkCount(repoId: String) throws -> Int {
+    try openIfNeeded()
+    guard let db else { throw RAGError.sqlite("Database not initialized") }
+    var stmt: OpaquePointer?
+    let sql = "SELECT COUNT(*) FROM chunks c JOIN files f ON f.id = c.file_id WHERE f.repo_id = ?"
+    guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+      throw RAGError.sqlite("testOnlyChunkCount prepare failed")
+    }
+    defer { sqlite3_finalize(stmt) }
+    sqlite3_bind_text(stmt, 1, repoId, -1, sqliteTransient)
+    return sqlite3_step(stmt) == SQLITE_ROW ? Int(sqlite3_column_int(stmt, 0)) : 0
   }
 }
