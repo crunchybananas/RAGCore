@@ -1135,6 +1135,15 @@ extension RAGStore {
     }
   }
 
+  /// Delete ONLY a chunk row, leaving its embedding behind — the shape the
+  /// re-index leak produced. Tests only; deliberately corrupts integrity.
+  public func testOnlyDeleteChunkRowOnly(chunkId: String) throws {
+    try openIfNeeded()
+    try execute(sql: "DELETE FROM chunks WHERE id = ?") { stmt in
+      bindText(stmt, 1, chunkId)
+    }
+  }
+
   /// Embeddings whose chunk row no longer exists at all. Distinct from an
   /// embedding on a DANGLING chunk: here there is no chunk row to be dangling.
   public func testOnlyOrphanEmbeddingCount() throws -> Int {

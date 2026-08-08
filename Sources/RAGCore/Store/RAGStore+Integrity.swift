@@ -73,6 +73,27 @@ extension RAGStore {
     return RAGStoreIntegrityReport(danglingChunks: chunks, danglingEmbeddings: embeddings)
   }
 
+  /// Just the dangling-chunk count, for callers that need a cheap yes/no.
+  ///
+  /// `integrityReport()` also counts unreachable embeddings, and that query is
+  /// the expensive half: measured on a 2.3 GB store, 0.21s warm but 2.6s cold,
+  /// against 0.04s for this one. Surfaces documented as fast — `system.doctor`
+  /// promises no file I/O in its own header — should use this and leave the
+  /// full report to the tool that explicitly asks for it.
+  ///
+  /// A non-zero answer here is sufficient to say "this store has unreferenced
+  /// rows"; it is NOT the whole picture, because embeddings can be orphaned
+  /// while no chunk is. Callers must not report zero here as "clean".
+  public func danglingChunkCount() throws -> Int {
+    try openIfNeeded()
+    guard let db else { throw RAGError.sqlite("Database not initialized") }
+    return try Self.scalar(
+      db,
+      "SELECT COUNT(*) FROM chunks c LEFT JOIN files f ON f.id = c.file_id WHERE f.id IS NULL",
+      label: "danglingChunkCount"
+    )
+  }
+
   /// Delete every unreferenced row and return what was removed.
   ///
   /// Safe by construction: nothing can legitimately reference a chunk whose
