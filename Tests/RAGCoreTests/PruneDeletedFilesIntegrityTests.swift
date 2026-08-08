@@ -165,4 +165,34 @@ struct PruneDeletedFilesIntegrityTests {
     #expect(report.isClean)
     #expect(try await store.testOnlyOrphanEmbeddingCount() == 0)
   }
+
+  /// The cheap signal must agree with the full report about dangling chunks,
+  /// and must NOT be mistaken for a clean verdict on its own.
+  @Test("danglingChunkCount agrees with the full report")
+  func cheapCountAgreesWithFullReport() async throws {
+    let store = try await makeStore()
+    try await seed(store)
+    #expect(try await store.danglingChunkCount() == 0)
+
+    try await store.testOnlyDeleteFileRowOnly(fileId: "f1")
+    let report = try await store.integrityReport()
+    #expect(try await store.danglingChunkCount() == report.danglingChunks)
+    #expect(try await store.danglingChunkCount() == 1)
+  }
+
+  /// A store can have zero dangling chunks and still be dirty — this is the
+  /// re-index leak, where the chunk row is gone and only the embedding remains.
+  /// The cheap count cannot see it, which is why it is documented as
+  /// insufficient for a clean verdict.
+  @Test("danglingChunkCount alone cannot prove a store is clean")
+  func cheapCountIsNotACleanVerdict() async throws {
+    let store = try await makeStore()
+    try await seed(store)
+    try await store.testOnlyDeleteChunkRowOnly(chunkId: "c0")
+
+    #expect(try await store.danglingChunkCount() == 0, "no chunk is dangling — its row is gone entirely")
+    let report = try await store.integrityReport()
+    #expect(report.danglingEmbeddings == 1, "but an embedding is orphaned")
+    #expect(!report.isClean)
+  }
 }
