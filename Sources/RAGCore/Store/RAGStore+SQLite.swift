@@ -363,10 +363,26 @@ extension RAGStore {
     }
   }
 
+  /// Remove one file's chunks and everything keyed on them.
+  ///
+  /// Nothing cascades in this store — no `ON DELETE CASCADE`, and the
+  /// `foreign_keys` pragma is never enabled — so every child table is deleted
+  /// explicitly, child before parent.
+  ///
+  /// `embeddings` used to be missing from that list, and this runs on EVERY
+  /// re-index of a changed file. Chunk ids are derived from content
+  /// (`VectorMath.stableId(for: "fileId:start:end:text")`), so a changed file
+  /// gets new chunk ids and its old embeddings were stranded permanently — one
+  /// leak per edited file, on every edit. Measured on one machine: 83,153
+  /// embeddings whose chunk row no longer existed, against 42,440 still
+  /// reachable from a live file (cloke/peel#1881).
   internal func deleteChunks(for fileId: String) throws {
     if extensionLoaded {
       let vecSql = "DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = ?)"
       try execute(sql: vecSql) { stmt in bindText(stmt, 1, fileId) }
+    }
+    try execute(sql: "DELETE FROM embeddings WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = ?)") { stmt in
+      bindText(stmt, 1, fileId)
     }
     try execute(sql: "DELETE FROM chunks WHERE file_id = ?") { stmt in
       bindText(stmt, 1, fileId)

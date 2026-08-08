@@ -565,24 +565,13 @@ extension RAGStore {
 
     for staleFile in staleFiles {
       try Task.checkCancellation()
-      // vec_chunks first (virtual table — no CASCADE)
-      if extensionLoaded {
-        let vecSql = "DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = ?)"
-        try execute(sql: vecSql) { stmt in
-          bindText(stmt, 1, staleFile.id)
-        }
-      }
-      // Delete dependencies and symbol refs/defs
+      // One function owns "remove a file's chunks and everything keyed on
+      // them" — vec_chunks, embeddings, then chunks. Duplicating that list is
+      // exactly how embeddings came to be missing from one copy of it.
+      try deleteChunks(for: staleFile.id)
       try deleteDependencies(for: staleFile.id)
       try deleteSymbolRefs(for: staleFile.id)
       try deleteSymbols(for: staleFile.id)
-      // Embeddings are keyed on chunk, so they go before the chunks do.
-      try execute(sql: "DELETE FROM embeddings WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = ?)") { stmt in
-        bindText(stmt, 1, staleFile.id)
-      }
-      try execute(sql: "DELETE FROM chunks WHERE file_id = ?") { stmt in
-        bindText(stmt, 1, staleFile.id)
-      }
       // Finally the parent row, now that nothing references it.
       let delSql = "DELETE FROM files WHERE id = ?"
       try execute(sql: delSql) { stmt in
