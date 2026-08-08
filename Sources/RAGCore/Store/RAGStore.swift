@@ -1123,6 +1123,18 @@ extension RAGStore {
     return out
   }
 
+  /// Delete ONLY the file row, leaving its chunks and embeddings behind.
+  ///
+  /// Reproduces the exact shape of the `pruneDeletedFiles` bug so the sweep is
+  /// tested against real orphans rather than synthetic ones. Do not use this
+  /// outside tests: it deliberately corrupts referential integrity.
+  public func testOnlyDeleteFileRowOnly(fileId: String) throws {
+    try openIfNeeded()
+    try execute(sql: "DELETE FROM files WHERE id = ?") { stmt in
+      bindText(stmt, 1, fileId)
+    }
+  }
+
   /// Chunks still reachable from one repo's files — catches rows orphaned by a
   /// partial delete.
   public func testOnlyChunkCount(repoId: String) throws -> Int {

@@ -519,8 +519,20 @@ extension RAGStore {
   // MARK: - Stale File Pruning
 
   /// Remove files from the index that no longer exist on disk.
-  /// Cascades to chunks → embeddings via FK constraints; vec_chunks
-  /// must be cleaned explicitly since virtual tables don't support CASCADE.
+  ///
+  /// Every child table is deleted EXPLICITLY, in child-before-parent order.
+  /// Nothing here cascades: the schema declares plain
+  /// `FOREIGN KEY (file_id) REFERENCES files(id)` with no `ON DELETE CASCADE`,
+  /// and SQLite's `foreign_keys` pragma defaults to OFF and is never turned on
+  /// anywhere in RAGCore, so a bare `DELETE FROM files` abandons its rows
+  /// rather than cascading to them.
+  ///
+  /// This function used to delete `dependencies`, `symbol_refs` and `symbols`
+  /// by hand while assuming `chunks` and `embeddings` cascaded. They did not.
+  /// Because pruning runs on every index refresh, each renamed or deleted file
+  /// leaked its chunks and embeddings, and the orphans accumulated for as long
+  /// as the index has existed (cloke/peel#1881: 11,218 dangling chunks and
+  /// 10,906 dangling embeddings on one machine, still growing when measured).
   internal func pruneDeletedFiles(repoId: String, currentPaths: Set<String>) throws -> Int {
     guard let db else {
       throw RAGError.sqlite("Database not initialized")
@@ -564,7 +576,14 @@ extension RAGStore {
       try deleteDependencies(for: staleFile.id)
       try deleteSymbolRefs(for: staleFile.id)
       try deleteSymbols(for: staleFile.id)
-      // Delete the file row — chunks and embeddings cascade
+      // Embeddings are keyed on chunk, so they go before the chunks do.
+      try execute(sql: "DELETE FROM embeddings WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = ?)") { stmt in
+        bindText(stmt, 1, staleFile.id)
+      }
+      try execute(sql: "DELETE FROM chunks WHERE file_id = ?") { stmt in
+        bindText(stmt, 1, staleFile.id)
+      }
+      // Finally the parent row, now that nothing references it.
       let delSql = "DELETE FROM files WHERE id = ?"
       try execute(sql: delSql) { stmt in
         bindText(stmt, 1, staleFile.id)
