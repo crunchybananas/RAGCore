@@ -139,4 +139,30 @@ struct PruneDeletedFilesIntegrityTests {
     #expect(removed.isClean)
     #expect(try await store.testOnlyChunkCount(repoId: "r") == 2)
   }
+
+  /// THE bigger leak. `deleteChunks` runs on every re-index of a changed file,
+  /// and used to delete chunks while leaving their embeddings behind. Chunk ids
+  /// are content-derived, so a changed file gets new ids and the old embeddings
+  /// were stranded permanently — one leak per edit, on every edited file.
+  ///
+  /// This is a DIFFERENT population from the prune bug: there the chunk row
+  /// survives as a dangling row, here the chunk row is gone entirely and only
+  /// the embedding is left, which is why a report that only counts "embeddings
+  /// on a dangling chunk" cannot see it.
+  @Test("re-indexing a file does not strand its old embeddings")
+  func reindexDoesNotStrandEmbeddings() async throws {
+    let store = try await makeStore()
+    try await seed(store)
+
+    // What a re-index does: drop the file's chunks, then write new ones.
+    try await store.deleteChunks(for: "f0")
+
+    let report = try await store.integrityReport()
+    #expect(
+      report.danglingEmbeddings == 0,
+      "the old embedding must go with the chunk it was keyed on, not outlive it"
+    )
+    #expect(report.isClean)
+    #expect(try await store.testOnlyOrphanEmbeddingCount() == 0)
+  }
 }
