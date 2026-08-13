@@ -115,6 +115,8 @@ extension RAGStore {
     let modulePath: String?
     let featureTags: String?
     let tokenCount: Int
+    /// nil when the chunk predates schema v19 or its language has no comments.
+    let structure: ChunkStructureMetrics?
   }
 
   internal func queryEmbeddingRows(
@@ -152,6 +154,7 @@ extension RAGStore {
       let featureTags = sqlite3_column_text(stmt, 10).map { String(cString: $0) }
       let aiSummary = sqlite3_column_text(stmt, 11).map { String(cString: $0) }
       let tokenCount = Int(sqlite3_column_int(stmt, 12))
+      let structure = decodeStructureMetrics(stmt, firstColumn: 13)
       _ = aiSummary // used by caller via querySearchResults
 
       rows.append(EmbeddingRow(
@@ -167,7 +170,8 @@ extension RAGStore {
         isTest: isTestFile(filePath),
         modulePath: modulePath,
         featureTags: featureTags,
-        tokenCount: tokenCount
+        tokenCount: tokenCount,
+        structure: structure
       ))
     }
     return rows
@@ -205,6 +209,7 @@ extension RAGStore {
       let aiSummary = sqlite3_column_text(stmt, 9).map { String(cString: $0) }
       let aiTagsJson = sqlite3_column_text(stmt, 10).map { String(cString: $0) }
       let tokenCount = Int(sqlite3_column_int(stmt, 11))
+      let structure = decodeStructureMetrics(stmt, firstColumn: 12)
 
       let featureTags: [String]?
       if let json = featureTagsJson, let data = json.data(using: .utf8) {
@@ -234,7 +239,8 @@ extension RAGStore {
         featureTags: featureTags ?? [],
         aiSummary: aiSummary,
         aiTags: aiTags ?? [],
-        tokenCount: tokenCount
+        tokenCount: tokenCount,
+        structure: structure
       ))
     }
     return results
@@ -340,11 +346,12 @@ extension RAGStore {
     aiSummary: String? = nil,
     aiTags: String? = nil,
     analyzedAt: String? = nil,
-    analyzerModel: String? = nil
+    analyzerModel: String? = nil,
+    structure: ChunkStructureMetrics? = nil
   ) throws {
     let sql = """
-      INSERT OR REPLACE INTO chunks (id, file_id, start_line, end_line, text, token_count, construct_type, construct_name, metadata, ai_summary, ai_tags, analyzed_at, analyzer_model)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR REPLACE INTO chunks (id, file_id, start_line, end_line, text, token_count, construct_type, construct_name, metadata, ai_summary, ai_tags, analyzed_at, analyzer_model, comment_lines, code_lines, max_comment_block, has_commented_out_code)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       """
     try execute(sql: sql) { stmt in
       bindText(stmt, 1, id)
@@ -360,6 +367,17 @@ extension RAGStore {
       bindTextOrNull(stmt, 11, aiTags)
       bindTextOrNull(stmt, 12, analyzedAt)
       bindTextOrNull(stmt, 13, analyzerModel)
+      // NULL, not 0, for a language with no comment syntax. Zero would mean
+      // "measured, none found" and would sort Markdown to the top of any
+      // least-commented query.
+      if let structure {
+        sqlite3_bind_int(stmt, 14, Int32(structure.commentLines))
+        sqlite3_bind_int(stmt, 15, Int32(structure.codeLines))
+        sqlite3_bind_int(stmt, 16, Int32(structure.maxCommentBlockLines))
+        sqlite3_bind_int(stmt, 17, structure.containsCommentedOutCode ? 1 : 0)
+      } else {
+        for column in Int32(14)...Int32(17) { sqlite3_bind_null(stmt, column) }
+      }
     }
   }
 

@@ -55,7 +55,8 @@ extension RAGStore {
     var sqlBase = """
       SELECT repos.root_path || '/' || files.path, chunks.start_line, chunks.end_line, chunks.text,
              chunks.construct_type, chunks.construct_name, files.language, files.module_path, files.feature_tags,
-             chunks.ai_summary, chunks.ai_tags, chunks.token_count
+             chunks.ai_summary, chunks.ai_tags, chunks.token_count,
+             chunks.comment_lines, chunks.code_lines, chunks.max_comment_block, chunks.has_commented_out_code
       FROM chunks
       JOIN files ON files.id = chunks.file_id
       JOIN repos ON repos.id = files.repo_id
@@ -289,7 +290,8 @@ extension RAGStore {
         chunks.construct_type, chunks.construct_name,
         files.language, files.module_path, files.feature_tags,
         chunks.ai_summary, chunks.ai_tags, chunks.token_count,
-        vec_distance_cosine(v.embedding, ?) as distance
+        vec_distance_cosine(v.embedding, ?) as distance,
+        chunks.comment_lines, chunks.code_lines, chunks.max_comment_block, chunks.has_commented_out_code
       FROM vec_chunks v
       JOIN chunks ON chunks.id = v.chunk_id
       JOIN files ON files.id = chunks.file_id
@@ -362,7 +364,11 @@ extension RAGStore {
         snippet: snippet, constructType: constructType, constructName: constructName,
         language: language, isTest: isTestFile(filePath), score: similarity,
         modulePath: modulePath, featureTags: featureTags ?? [],
-        aiSummary: aiSummary, aiTags: aiTags ?? [], tokenCount: tokenCount
+        aiSummary: aiSummary, aiTags: aiTags ?? [], tokenCount: tokenCount,
+        // Appended AFTER `distance` deliberately: this reader indexes columns
+        // positionally, so inserting ahead of it would silently read
+        // comment_lines as the similarity score.
+        structure: decodeStructureMetrics(statement, firstColumn: 13)
       ))
       if results.count >= limit { break }
     }
@@ -383,7 +389,8 @@ extension RAGStore {
              chunks.start_line, chunks.end_line, chunks.text,
              chunks.construct_type, chunks.construct_name,
              files.language, files.module_path, files.feature_tags,
-             chunks.ai_summary, chunks.token_count
+             chunks.ai_summary, chunks.token_count,
+             chunks.comment_lines, chunks.code_lines, chunks.max_comment_block, chunks.has_commented_out_code
       FROM embeddings e
       JOIN chunks ON chunks.id = e.chunk_id
       JOIN files ON files.id = chunks.file_id
@@ -420,7 +427,8 @@ extension RAGStore {
         snippet: row.snippet, constructType: row.constructType, constructName: row.constructName,
         language: row.language, isTest: row.isTest, score: item.score,
         modulePath: row.modulePath, featureTags: featureTags ?? [],
-        aiSummary: nil, aiTags: [], tokenCount: row.tokenCount
+        aiSummary: nil, aiTags: [], tokenCount: row.tokenCount,
+        structure: row.structure
       )
     }
   }

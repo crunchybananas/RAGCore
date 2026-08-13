@@ -32,6 +32,13 @@ public struct RAGSearchResult: Sendable {
   /// Token count for the original code chunk.
   public let tokenCount: Int?
 
+  /// Comment-shape metrics for this chunk, or nil when the chunk predates
+  /// schema v19 or its language has no comment syntax (cloke/peel#2202).
+  ///
+  /// Nil means unmeasured, never "no comments" — a caller ranking by comment
+  /// ratio must skip these rows rather than read them as zero.
+  public let structure: ChunkStructureMetrics?
+
   /// Number of lines in this chunk.
   public var lineCount: Int { endLine - startLine + 1 }
 
@@ -49,7 +56,8 @@ public struct RAGSearchResult: Sendable {
     featureTags: [String] = [],
     aiSummary: String? = nil,
     aiTags: [String] = [],
-    tokenCount: Int? = nil
+    tokenCount: Int? = nil,
+    structure: ChunkStructureMetrics? = nil
   ) {
     self.filePath = filePath
     self.startLine = startLine
@@ -65,5 +73,6 @@ public struct RAGSearchResult: Sendable {
     self.aiSummary = aiSummary
     self.aiTags = aiTags
     self.tokenCount = tokenCount
+    self.structure = structure
   }
 }

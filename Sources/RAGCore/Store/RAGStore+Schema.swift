@@ -2,7 +2,7 @@
 //  RAGStore+Schema.swift
 //  RAGCore
 //
-//  Schema management and migrations (v1→v20).
+//  Schema management and migrations (v1→v21).
 //
 
 import CSQLite
@@ -496,6 +496,27 @@ extension RAGStore {
       }
       try exec("CREATE INDEX IF NOT EXISTS idx_lessons_source_learning ON lessons(source_learning_id)")
       try setSchemaVersion(20)
+    }
+
+    if schemaVersion < 21 {
+      // Structural comment metrics per chunk (cloke/peel#2202). These answer
+      // questions retrieval cannot phrase — comment-to-code ratio, abandoned
+      // code left in comments, oversized comment blocks.
+      //
+      // Added NULL rather than backfilled here. Computing them needs each
+      // chunk's text and its file's language, so a migration would scan the
+      // whole chunks table at open() — on a large index that turns the first
+      // launch after upgrade into a stall. Re-indexing fills them,
+      // `backfillStructureMetrics()` fills them on demand, and NULL is
+      // reported as unmeasured rather than counted as zero.
+      for column in ["comment_lines INTEGER", "code_lines INTEGER",
+                     "max_comment_block INTEGER", "has_commented_out_code INTEGER"] {
+        let name = String(column.split(separator: " ")[0])
+        if !columnExists("chunks", column: name) {
+          try exec("ALTER TABLE chunks ADD COLUMN \(column)")
+        }
+      }
+      try setSchemaVersion(21)
     }
 
     // Deliberately outside the version gates: a database can reach a high
