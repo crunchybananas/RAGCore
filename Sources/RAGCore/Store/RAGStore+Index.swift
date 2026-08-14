@@ -438,7 +438,8 @@ extension RAGStore {
           metadata: chunk.metadata, aiSummary: cachedAnalysis?.summary,
           aiTags: cachedAnalysis?.tags,
           analyzedAt: cachedAnalysis != nil ? dateFormatter.string(from: Date()) : nil,
-          analyzerModel: cachedAnalysis?.model
+          analyzerModel: cachedAnalysis?.model,
+          structure: ChunkStructureMetrics.compute(text: chunk.text, language: file.language)
         )
 
         let embedding: [Float]

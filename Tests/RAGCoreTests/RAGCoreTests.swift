@@ -28,7 +28,7 @@ struct RAGCoreTests {
     let decoded = try #require(VectorMath.decodeVector(encoded))
     #expect(decoded.count == original.count)
     for (a, b) in zip(original, decoded) {
-      #expect(abs(a - b) < 0.0001)
+      #expect(abs(a - b) < Float(0.0001))
     }
   }
 }
