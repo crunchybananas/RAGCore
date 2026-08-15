@@ -184,6 +184,9 @@ actor OllamaEmbeddingRequestGate {
         return true
       case .modelNotAvailable:
         return false
+      case .requestTimedOut:
+        // The typed form of URLError.timedOut above — same classification.
+        return true
       }
     }
     return false
