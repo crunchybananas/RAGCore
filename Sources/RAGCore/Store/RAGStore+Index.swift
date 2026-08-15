@@ -103,6 +103,7 @@ extension RAGStore {
       var totalFiles = 0, totalSkipped = 0, totalRemoved = 0, totalChunks = 0
       var totalBytes = 0, totalEmbeddings = 0, totalEmbeddingMs = 0
       var totalAST = 0, totalLine = 0, totalFailures = 0
+      var totalPolicyExcluded: [String] = []
 
       print("[RAG] Workspace detected at \(path): auto-indexing \(allSubPaths.count) sub-packages")
       for (idx, subPath) in allSubPaths.enumerated() {
@@ -149,6 +150,7 @@ extension RAGStore {
         totalAST += subReport.astFilesChunked
         totalLine += subReport.lineFilesChunked
         totalFailures += subReport.chunkingFailures
+        totalPolicyExcluded += subReport.excludedByPolicy
       }
 
       let durationMs = Int(Date().timeIntervalSince(startTime) * 1000)
@@ -167,6 +169,7 @@ extension RAGStore {
         astFilesChunked: totalAST,
         lineFilesChunked: totalLine,
         chunkingFailures: totalFailures,
+        excludedByPolicy: totalPolicyExcluded,
         subReports: subReports
       )
       progress?(.complete(report: report))
@@ -183,7 +186,8 @@ extension RAGStore {
       isTracked: { ((try? resolveRepo(for: $0)) ?? nil) != nil }
     )
     let effectiveScanner = excludedDirectories.map { RAGFileScanner(excludedDirectories: $0) } ?? scanner
-    let scannedFiles = try effectiveScanner.scanCancellable(rootURL: repoURL, excludingRoots: excludedRoots)
+    let scanOutcome = try effectiveScanner.scanCancellable(rootURL: repoURL, excludingRoots: excludedRoots)
+    let scannedFiles = scanOutcome.candidates
     try Task.checkCancellation()
     logMemory("after scan \(scannedFiles.count) files")
     progress?(.scanning(fileCount: scannedFiles.count))
@@ -511,7 +515,8 @@ extension RAGStore {
       astFilesChunked: astFilesChunked,
       lineFilesChunked: lineFilesChunked,
       chunkingFailures: chunkingFailures,
-      embeddingSkippedFiles: skippedEmbeddingFiles
+      embeddingSkippedFiles: skippedEmbeddingFiles,
+      excludedByPolicy: scanOutcome.policyExcludedPaths
     )
     progress?(.complete(report: report))
     return report
