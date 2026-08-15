@@ -1144,6 +1144,22 @@ extension RAGStore {
     }
   }
 
+  /// Row count for one table under a caller-supplied WHERE clause. Test-only:
+  /// the clause is interpolated, so it must never carry untrusted input —
+  /// tests use it to assert per-row-class teardown (#11 purge) without adding
+  /// a public accessor per table.
+  public func testOnlyRowCount(table: String, whereClause: String) throws -> Int {
+    try openIfNeeded()
+    guard let db else { throw RAGError.sqlite("Database not initialized") }
+    var stmt: OpaquePointer?
+    let sql = "SELECT COUNT(*) FROM \(table) WHERE \(whereClause)"
+    guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+      throw RAGError.sqlite("testOnlyRowCount prepare failed")
+    }
+    defer { sqlite3_finalize(stmt) }
+    return sqlite3_step(stmt) == SQLITE_ROW ? Int(sqlite3_column_int(stmt, 0)) : 0
+  }
+
   /// Embeddings whose chunk row no longer exists at all. Distinct from an
   /// embedding on a DANGLING chunk: here there is no chunk row to be dangling.
   public func testOnlyOrphanEmbeddingCount() throws -> Int {

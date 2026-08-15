@@ -402,6 +402,14 @@ extension RAGStore {
     try execute(sql: "DELETE FROM embeddings WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = ?)") { stmt in
       bindText(stmt, 1, fileId)
     }
+    // chunk_analysis was missing from this list for as long as the table has
+    // existed: AI summaries and tags of deleted content survived every delete
+    // path in the store — the exact class of stranded child row this function
+    // exists to prevent, and a data-retention hole for the #11 purge (a
+    // credential file's ANALYSIS must not outlive the credential file).
+    try execute(sql: "DELETE FROM chunk_analysis WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = ?)") { stmt in
+      bindText(stmt, 1, fileId)
+    }
     try execute(sql: "DELETE FROM chunks WHERE file_id = ?") { stmt in
       bindText(stmt, 1, fileId)
     }

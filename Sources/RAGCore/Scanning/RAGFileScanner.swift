@@ -39,12 +39,19 @@ public struct RAGFileScanner: Sendable {
     ".packed.",
   ]
 
+  /// The mandatory credential boundary (#11). Always consulted BEFORE any
+  /// other filter and before any byte is read; `.ragignore` cannot weaken it.
+  /// The only relaxation is the policy's own per-pattern unsafe opt-in.
+  public var credentialPolicy: CredentialExclusionPolicy
+
   public init(
     maxFileBytes: Int = 1_000_000,
-    excludedDirectories: Set<String>? = nil
+    excludedDirectories: Set<String>? = nil,
+    credentialPolicy: CredentialExclusionPolicy = .standard
   ) {
     self.maxFileBytes = maxFileBytes
     self.excludedDirectories = excludedDirectories ?? Self.defaultExcludedDirectories
+    self.credentialPolicy = credentialPolicy
   }
 
   public static let defaultExcludedDirectories: Set<String> = [
@@ -63,6 +70,14 @@ public struct RAGFileScanner: Sendable {
     "vendor",
   ]
 
+  /// A scan's full outcome: the indexable candidates plus the root-relative
+  /// paths the mandatory credential policy refused (#11). Paths only — the
+  /// refused files were never read, so there are no contents to leak.
+  public struct ScanOutcome: Sendable {
+    public let candidates: [RAGFileCandidate]
+    public let policyExcludedPaths: [String]
+  }
+
   /// Scan a directory for indexable source files.
   ///
   /// - Parameters:
@@ -70,6 +85,11 @@ public struct RAGFileScanner: Sendable {
   ///   - excludingRoots: Absolute paths to skip entirely (e.g. sub-repo roots).
   /// - Returns: Array of file candidates with their paths, sizes, and languages.
   public func scan(rootURL: URL, excludingRoots: [String] = []) -> [RAGFileCandidate] {
+    scan(rootURL: rootURL, excludingRoots: excludingRoots, cancellationCheck: {}).candidates
+  }
+
+  /// Scan and also report what the credential policy refused (#11).
+  public func scanWithOutcome(rootURL: URL, excludingRoots: [String] = []) -> ScanOutcome {
     scan(rootURL: rootURL, excludingRoots: excludingRoots, cancellationCheck: {})
   }
 
@@ -78,7 +98,7 @@ public struct RAGFileScanner: Sendable {
   /// Kept internal because the public non-throwing API predates cancellation.
   /// Indexing uses this path so a cancelled task does not finish walking a large
   /// repository before it can stop.
-  internal func scanCancellable(rootURL: URL, excludingRoots: [String] = []) throws -> [RAGFileCandidate] {
+  internal func scanCancellable(rootURL: URL, excludingRoots: [String] = []) throws -> ScanOutcome {
     try scan(
       rootURL: rootURL,
       excludingRoots: excludingRoots,
@@ -90,30 +110,53 @@ public struct RAGFileScanner: Sendable {
     rootURL: URL,
     excludingRoots: [String],
     cancellationCheck: () throws -> Void
-  ) rethrows -> [RAGFileCandidate] {
+  ) rethrows -> ScanOutcome {
     try cancellationCheck()
     guard let enumerator = FileManager.default.enumerator(
       at: rootURL,
       includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
       options: [.skipsHiddenFiles, .skipsPackageDescendants]
     ) else {
-      return []
+      return ScanOutcome(candidates: [], policyExcludedPaths: [])
     }
 
     let ignorePatterns = Self.loadIgnorePatterns(rootURL: rootURL)
     var results: [RAGFileCandidate] = []
+    var policyExcluded: [String] = []
 
     for case let fileURL as URL in enumerator {
       try cancellationCheck()
+
+      // The credential boundary runs FIRST, before every other filter, so no
+      // later rule (and no .ragignore content) influences it. Checked on the
+      // entry's own name/path AND, for symlinks, on the resolved target's
+      // name — a link named notes.txt pointing at id_rsa is still a
+      // credential read (#11).
+      let isDirectoryEntry = (try? fileURL.resourceValues(
+        forKeys: [.isDirectoryKey]
+      ).isDirectory) == true
+      if !isDirectoryEntry {
+        let relative = Self.rootRelativePath(of: fileURL.path, under: rootURL)
+          ?? fileURL.lastPathComponent
+        var refused = credentialPolicy.excludes(
+          relativePath: relative, fileName: fileURL.lastPathComponent)
+        if !refused,
+           let destination = try? FileManager.default.destinationOfSymbolicLink(atPath: fileURL.path) {
+          let targetName = (destination as NSString).lastPathComponent
+          refused = credentialPolicy.excludes(relativePath: destination, fileName: targetName)
+        }
+        if refused {
+          policyExcluded.append(relative)
+          continue
+        }
+      }
+
       if shouldSkip(url: fileURL, rootURL: rootURL, ignorePatterns: ignorePatterns, excludedRoots: excludingRoots) {
         // `skipDescendants()` is only valid for a directory. Calling it after
         // an ignored file (for example `poetry.lock`) makes Foundation skip
         // the file's later siblings too, which can silently prune an entire
         // source directory from the scan.
-        let isDirectory = (try? fileURL.resourceValues(
-          forKeys: [.isDirectoryKey]
-        ).isDirectory) == true
-        if isDirectory {
+        if isDirectoryEntry {
           enumerator.skipDescendants()
         }
         continue
@@ -133,12 +176,19 @@ public struct RAGFileScanner: Sendable {
       )
     }
 
-    return results
+    return ScanOutcome(candidates: results, policyExcludedPaths: policyExcluded)
   }
 
   /// Load a file candidate into memory.
   public func loadFile(candidate: RAGFileCandidate) -> RAGScannedFile? {
     let url = URL(fileURLWithPath: candidate.path)
+    // Defense in depth: the scan gate is the boundary, but this is the one
+    // place in the package that reads repository bytes, so it refuses
+    // credential-shaped paths on its own too — a future caller that builds
+    // candidates without scanning inherits the guarantee (#11).
+    guard !credentialPolicy.excludes(
+      relativePath: candidate.path, fileName: url.lastPathComponent
+    ) else { return nil }
     guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) else {
       return nil
     }
@@ -184,18 +234,62 @@ public struct RAGFileScanner: Sendable {
     return false
   }
 
-  /// Parse the scan root's `.ragignore` into raw patterns. Shared with the
-  /// workspace/sub-package detectors so directory discovery honors the same
-  /// ignore file as file scanning (crunchybananas/RAGCore#4).
+  /// Root-relative form of `path` under `rootURL`, robust to the /var vs
+  /// /private/var standardization mismatch: Foundation's enumerator can
+  /// return standardized URLs for a non-standardized root (temporary
+  /// directories hit this every time), and a failed prefix match silently
+  /// degraded relative paths to bare file names — which weakened every
+  /// path-anchored ignore pattern for such roots.
+  internal static func rootRelativePath(of path: String, under rootURL: URL) -> String? {
+    var roots = Set<String>()
+    for base in [rootURL.path, rootURL.standardizedFileURL.path, rootURL.resolvingSymlinksInPath().path] {
+      // Foundation is asymmetric about the /private alias: the enumerator
+      // returns /private/var/... entries while resolvingSymlinksInPath on the
+      // root STRIPS /private (a documented oddity), so neither side alone
+      // ever matches for temporary directories. Track both spellings.
+      let slashed = base.hasSuffix("/") ? base : base + "/"
+      roots.insert(slashed)
+      if slashed.hasPrefix("/private/") {
+        roots.insert(String(slashed.dropFirst("/private".count)))
+      } else {
+        roots.insert("/private" + slashed)
+      }
+    }
+    for root in roots where path.hasPrefix(root) {
+      return String(path.dropFirst(root.count))
+    }
+    return nil
+  }
+
+  /// Parse the scan root's `.ragignore` AND root `.gitignore` into raw
+  /// patterns. Shared with the workspace/sub-package detectors so directory
+  /// discovery honors the same ignore files as file scanning
+  /// (crunchybananas/RAGCore#4, #11).
+  ///
+  /// Precedence is purely additive and documented (#11): the mandatory
+  /// credential policy is checked before any of this and cannot be affected
+  /// by it; `.ragignore` and root `.gitignore` patterns then both EXCLUDE.
+  /// Negated (`!`) lines are dropped from both files rather than emulated:
+  /// the matcher has no re-include machinery, and silently treating `!foo`
+  /// as an exclusion of the literal name `!foo` (the old behavior for
+  /// `.ragignore`) is stricter than gitignore in the safe direction, but
+  /// re-including is the unsafe direction and stays unsupported. Nested
+  /// `.gitignore` files are not read — root patterns only; a repository
+  /// needing deeper policy uses `.ragignore` at the root.
   internal static func loadIgnorePatterns(rootURL: URL) -> [String] {
-    let ignoreURL = rootURL.appendingPathComponent(".ragignore")
-    guard let contents = try? String(contentsOf: ignoreURL, encoding: .utf8) else {
+    let ragPatterns = patternLines(of: rootURL.appendingPathComponent(".ragignore"))
+    let gitPatterns = patternLines(of: rootURL.appendingPathComponent(".gitignore"))
+    return ragPatterns + gitPatterns
+  }
+
+  private static func patternLines(of fileURL: URL) -> [String] {
+    guard let contents = try? String(contentsOf: fileURL, encoding: .utf8) else {
       return []
     }
     return contents
       .split(whereSeparator: { $0 == "\n" || $0 == "\r" })
       .map { $0.trimmingCharacters(in: .whitespaces) }
-      .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+      .filter { !$0.isEmpty && !$0.hasPrefix("#") && !$0.hasPrefix("!") }
   }
 
   /// Match a path against `.ragignore` patterns.
@@ -208,8 +302,7 @@ public struct RAGFileScanner: Sendable {
   internal static func matchesIgnore(url: URL, rootURL: URL, patterns: [String], isDirectory: Bool = false) -> Bool {
     guard !patterns.isEmpty else { return false }
     let path = url.path
-    let rootPath = rootURL.path.hasSuffix("/") ? rootURL.path : rootURL.path + "/"
-    let relative = path.hasPrefix(rootPath) ? String(path.dropFirst(rootPath.count)) : path
+    let relative = Self.rootRelativePath(of: path, under: rootURL) ?? path
     let fileName = url.lastPathComponent
 
     for pattern in patterns {

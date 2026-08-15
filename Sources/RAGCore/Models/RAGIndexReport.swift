@@ -33,6 +33,12 @@ public struct RAGIndexReport: Sendable {
   /// indexing completed normally.
   public let embeddingSkippedFiles: Int
 
+  /// Root-relative paths the mandatory credential policy refused during
+  /// the scan (#11). Paths only, never contents — the files were never
+  /// read. Empty means nothing was refused, not "not measured": the
+  /// policy always runs.
+  public let excludedByPolicy: [String]
+
   /// Sub-reports for workspace indexing (one per sub-repo/sub-package).
   public let subReports: [RAGIndexReport]
 
@@ -43,9 +49,11 @@ public struct RAGIndexReport: Sendable {
     durationMs: Int, embeddingCount: Int, embeddingDurationMs: Int,
     astFilesChunked: Int, lineFilesChunked: Int, chunkingFailures: Int,
     embeddingSkippedFiles: Int = 0,
+    excludedByPolicy: [String] = [],
     subReports: [RAGIndexReport] = []
   ) {
     self.repoId = repoId
+    self.excludedByPolicy = excludedByPolicy
     self.repoPath = repoPath
     self.filesIndexed = filesIndexed
     self.filesSkipped = filesSkipped
