@@ -2,7 +2,7 @@
 //  RAGStore+Schema.swift
 //  RAGCore
 //
-//  Schema management and migrations (v1→v21).
+//  Schema management and migrations (v1→v22).
 //
 
 import CSQLite
@@ -517,6 +517,50 @@ extension RAGStore {
         }
       }
       try setSchemaVersion(21)
+    }
+
+    if schemaVersion < 22 {
+      // Blue/green analysis generations. Staging is deliberately separate
+      // from `chunks` and `embeddings`: every search and export read keeps
+      // seeing the active rows until one transaction promotes a complete
+      // replacement generation. A process crash therefore leaves resumable
+      // staging rather than a half-rebuilt live corpus.
+      if !columnExists("repos", column: "active_analysis_generation") {
+        try exec("ALTER TABLE repos ADD COLUMN active_analysis_generation TEXT")
+      }
+      try exec("""
+        CREATE TABLE IF NOT EXISTS analysis_generations (
+          id TEXT PRIMARY KEY,
+          repo_id TEXT NOT NULL,
+          analyzer_model TEXT NOT NULL,
+          state TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          committed_at TEXT,
+          FOREIGN KEY (repo_id) REFERENCES repos(id)
+        )
+        """)
+      try exec("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_analysis_generations_active_repo
+        ON analysis_generations(repo_id)
+        WHERE state IN ('analyzing', 'ready')
+        """)
+      try exec("""
+        CREATE TABLE IF NOT EXISTS staged_chunk_analysis (
+          generation_id TEXT NOT NULL,
+          chunk_id TEXT NOT NULL,
+          text_hash TEXT NOT NULL,
+          ai_summary TEXT NOT NULL,
+          ai_tags TEXT,
+          analyzed_at TEXT NOT NULL,
+          embedding BLOB,
+          enriched_at TEXT,
+          PRIMARY KEY (generation_id, chunk_id),
+          FOREIGN KEY (generation_id) REFERENCES analysis_generations(id),
+          FOREIGN KEY (chunk_id) REFERENCES chunks(id)
+        )
+        """)
+      try exec("CREATE INDEX IF NOT EXISTS idx_staged_chunk_analysis_chunk ON staged_chunk_analysis(chunk_id)")
+      try setSchemaVersion(22)
     }
 
     // Deliberately outside the version gates: a database can reach a high

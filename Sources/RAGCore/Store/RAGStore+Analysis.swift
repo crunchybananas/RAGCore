@@ -348,7 +348,7 @@ extension RAGStore {
 
   /// One embed call, nil on failure. Errors are logged and swallowed so the
   /// caller can degrade (batch → singles) instead of aborting the whole pass.
-  private func embed(_ texts: [String], describedAs label: String) async -> [[Float]]? {
+  internal func embed(_ texts: [String], describedAs label: String) async -> [[Float]]? {
     do {
       return try await embeddingProvider.embed(texts: texts)
     } catch {
