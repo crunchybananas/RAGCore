@@ -102,6 +102,9 @@ public actor RAGStore {
     /// declared intent — what the chunks were *actually* analyzed with can
     /// differ, and `analyzerDrift(repoPath:)` reports the gap.
     public let analyzerModel: String?
+    /// The generation whose analysis currently occupies the live chunk and
+    /// embedding rows. nil for corpora created before generation staging.
+    public let activeAnalysisGeneration: String?
   }
 
   public struct ChunkingHealthInfo: Sendable {
@@ -326,7 +329,8 @@ public actor RAGStore {
              r.parent_repo_id,
              r.embedding_model,
              r.embedding_dimensions,
-             r.analyzer_model
+             r.analyzer_model,
+             r.active_analysis_generation
       FROM repos r
       ORDER BY r.name
       """
@@ -358,13 +362,15 @@ public actor RAGStore {
       let embeddingDimensions: Int? = sqlite3_column_type(statement, 9) != SQLITE_NULL
         ? Int(sqlite3_column_int(statement, 9)) : nil
       let analyzerModel = sqlite3_column_text(statement, 10).map { String(cString: $0) }
+      let activeAnalysisGeneration = sqlite3_column_text(statement, 11).map { String(cString: $0) }
 
       repos.append(RepoInfo(
         id: id, name: name, rootPath: rootPath, lastIndexedAt: lastIndexedAt,
         fileCount: fileCount, chunkCount: chunkCount,
         repoIdentifier: repoIdentifier, parentRepoId: parentRepoId,
         embeddingModel: embeddingModel, embeddingDimensions: embeddingDimensions,
-        analyzerModel: analyzerModel
+        analyzerModel: analyzerModel,
+        activeAnalysisGeneration: activeAnalysisGeneration
       ))
     }
     return repos
@@ -448,6 +454,23 @@ public actor RAGStore {
         WHERE f.repo_id = ?
       )
       """, label: "embeddings")
+
+    // Staged analysis is just as sensitive as live analysis and must not
+    // outlive its repository. Delete it before chunks so no orphaned summary
+    // or embedding survives when foreign-key enforcement is unavailable.
+    try execDelete("DELETE FROM staged_chunk_analysis WHERE generation_id IN (SELECT id FROM analysis_generations WHERE repo_id = ?)", label: "staged_chunk_analysis")
+    try execDelete("DELETE FROM analysis_generations WHERE repo_id = ?", label: "analysis_generations")
+
+    // Multi-model analysis rows are chunk children too. This explicit delete
+    // mirrors `deleteChunks(for:)` and keeps repo deletion complete even when
+    // SQLite foreign keys are not enabled on the connection.
+    try execDelete("""
+      DELETE FROM chunk_analysis WHERE chunk_id IN (
+        SELECT c.id FROM chunks c
+        JOIN files f ON c.file_id = f.id
+        WHERE f.repo_id = ?
+      )
+      """, label: "chunk_analysis")
 
     // Delete chunks
     try execDelete("""
@@ -559,6 +582,16 @@ public actor RAGStore {
         SELECT c.id FROM chunks c WHERE c.file_id IN (\(targetFileIds))
       )
       """, label: "embeddings")
+    try execScoped("""
+      DELETE FROM staged_chunk_analysis WHERE chunk_id IN (
+        SELECT c.id FROM chunks c WHERE c.file_id IN (\(targetFileIds))
+      )
+      """, label: "staged_chunk_analysis")
+    try execScoped("""
+      DELETE FROM chunk_analysis WHERE chunk_id IN (
+        SELECT c.id FROM chunks c WHERE c.file_id IN (\(targetFileIds))
+      )
+      """, label: "chunk_analysis")
     try execScoped("DELETE FROM chunks WHERE file_id IN (\(targetFileIds))", label: "chunks")
     try execScoped("DELETE FROM files WHERE repo_id = ? AND (\(pathClause))", label: "files")
 

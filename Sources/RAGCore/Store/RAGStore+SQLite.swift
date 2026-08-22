@@ -410,6 +410,9 @@ extension RAGStore {
     try execute(sql: "DELETE FROM chunk_analysis WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = ?)") { stmt in
       bindText(stmt, 1, fileId)
     }
+    try execute(sql: "DELETE FROM staged_chunk_analysis WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = ?)") { stmt in
+      bindText(stmt, 1, fileId)
+    }
     try execute(sql: "DELETE FROM chunks WHERE file_id = ?") { stmt in
       bindText(stmt, 1, fileId)
     }
