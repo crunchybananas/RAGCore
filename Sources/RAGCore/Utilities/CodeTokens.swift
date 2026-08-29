@@ -70,18 +70,48 @@ public enum CodeTokens {
     // unicode61 then re-tokenizes the literal, which turns a snake_case or
     // dotted word into an implicit phrase of its parts - the same thing it
     // did to that word at index time.
+    //
+    // Prefix expansion recovers the recall that LIKE's substring matching
+    // provided for free: `layout` must find `layouts`, `resolveRepo` must
+    // find `resolveRepoIdentifier`. A trailing `*` outside the closing quote
+    // is FTS5's prefix operator (on a phrase it applies to the LAST token),
+    // and the measured cost of skipping it was recall@10 0.757 → 0.727 on
+    // the mined set. Terms whose final token is short stay exact - `re*` or
+    // `x*` would flood the candidate window with everything.
     let sanitized = word.replacingOccurrences(of: "\"", with: "")
     guard sanitized.contains(where: { $0.isLetter || $0.isNumber }) else { return nil }
-    var variants = [quoted(sanitized)]
+    var variants = [quoted(sanitized, prefix: prefixEligible(sanitized))]
     let parts = camelParts(sanitized)
     if parts.count > 1 {
-      variants.append(quoted(parts.joined(separator: " ")))
+      variants.append(quoted(
+        parts.joined(separator: " "),
+        prefix: prefixEligible(parts.last ?? "")
+      ))
     }
     return variants.count == 1 ? variants[0] : "(" + variants.joined(separator: " OR ") + ")"
   }
 
-  private static func quoted(_ term: String) -> String {
-    "\"" + term + "\""
+  /// Prefix-match only when the term's LAST alphanumeric run is long enough
+  /// to discriminate. unicode61 splits the quoted literal at punctuation, so
+  /// the prefix operator lands on that final run - `term-x` becomes the
+  /// phrase `term x` with the star on `x`, which is why the whole word's
+  /// length is not the right guard.
+  private static func prefixEligible(_ term: String) -> Bool {
+    var lastRun = 0
+    var currentRun = 0
+    for character in term {
+      if character.isLetter || character.isNumber {
+        currentRun += 1
+        lastRun = currentRun
+      } else {
+        currentRun = 0
+      }
+    }
+    return lastRun >= 4
+  }
+
+  private static func quoted(_ term: String, prefix: Bool = false) -> String {
+    "\"" + term + "\"" + (prefix ? "*" : "")
   }
 
   // MARK: - Splitting
