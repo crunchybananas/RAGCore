@@ -13,6 +13,13 @@
 //  queries and part *phrases* match); at query time each word expands to the
 //  same variants.
 //
+//  Known limitation: consecutive identifiers' appended part-groups are
+//  adjacent to EACH OTHER too, so a phrase query can occasionally bridge two
+//  identifiers (`resolveRepo fetchToken` appends `resolve repo fetch token`,
+//  which the phrase "repo fetch" matches). That inflates recall slightly on
+//  camelCase phrase queries; it never fabricates a term match, and BM25
+//  still ranks genuine hits above bridged ones in practice.
+//
 
 import Foundation
 

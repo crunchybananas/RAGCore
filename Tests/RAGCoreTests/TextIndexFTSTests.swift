@@ -221,6 +221,91 @@ struct TextIndexFTSTests {
     #expect(outcome.pendingTextIndexRepos == 0)
   }
 
+  // MARK: - Repair paths
+
+  @Test("backfill purges ghost postings whose chunk no longer exists")
+  func backfillPurgesGhosts() async throws {
+    let store = try await makeStore()
+    try await seed(store)
+    // A ghost: postings at a rowid no chunk owns (the REPLACE-without-
+    // recursive_triggers shape, simulated directly).
+    try await store.exec("""
+      INSERT INTO chunks_fts(rowid, text, construct_name, ai_summary, path)
+      VALUES (99999, 'ghostterm', '', '', '')
+      """)
+    let haunted = try await store.searchText(query: "ghostterm", repoPath: nil, limit: 10)
+    #expect(haunted.results.isEmpty, "a ghost rowid joins to no chunk, so it cannot surface")
+    _ = try await store.rebuildTextIndex(repoPath: "/r")
+    let count = try await store.queryInt(
+      "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'ghostterm'"
+    )
+    #expect(count == 0, "the backfill must purge postings no chunk owns")
+  }
+
+  @Test("full rebuild repairs stale postings that no verification can see")
+  func fullRebuildRepairsStalePostings() async throws {
+    let store = try await makeStore()
+    try await seed(store)
+    // Stale: the rowid exists, the content lies. Coverage verification is
+    // blind to this by design; only full: true repairs it.
+    try await store.exec(
+      "DELETE FROM chunks_fts WHERE rowid = (SELECT rowid FROM chunks WHERE id = 'c3')"
+    )
+    try await store.exec("""
+      INSERT INTO chunks_fts(rowid, text, construct_name, ai_summary, path)
+      VALUES ((SELECT rowid FROM chunks WHERE id = 'c3'), 'staleterm', '', '', '')
+      """)
+    let lying = try await store.searchText(query: "staleterm", repoPath: "/r", limit: 10)
+    #expect(lying.results.count == 1, "stale postings surface — that is the documented blindness")
+
+    _ = try await store.rebuildTextIndex(repoPath: "/r")
+    let stillLying = try await store.searchText(query: "staleterm", repoPath: "/r", limit: 10)
+    #expect(stillLying.results.count == 1, "a plain rebuild cannot detect staleness")
+
+    _ = try await store.rebuildTextIndex(repoPath: "/r", full: true)
+    let repaired = try await store.searchText(query: "staleterm", repoPath: "/r", limit: 10)
+    #expect(repaired.results.isEmpty)
+    let zebra = try await store.searchText(query: "zebra", repoPath: "/r", limit: 10)
+    #expect(zebra.results.count == 1, "full rebuild re-derives the true content")
+  }
+
+  @Test("a scoped search escalates past out-of-scope matches instead of starving")
+  func scopedSearchEscalatesWindow() async throws {
+    let store = try await makeStore()
+    try await seed(store)
+    // 401 tiny out-of-scope chunks all matching the term outrank one long
+    // in-scope chunk, saturating the first 400-row window.
+    try await store.upsertRepo(
+      id: "noise", name: "noise", rootPath: "/noise",
+      lastIndexedAt: nil, repoIdentifier: "github.com/x/noise"
+    )
+    try await store.upsertFile(
+      id: "nf", repoId: "noise", path: "N.swift", hash: "nh",
+      language: "swift", updatedAt: "2026-01-01", modulePath: nil, featureTags: nil
+    )
+    for index in 0..<401 {
+      try await store.upsertChunk(
+        id: "n\(index)", fileId: "nf", startLine: index, endLine: index,
+        text: "commonterm", tokenCount: 1,
+        constructType: nil, constructName: nil, metadata: nil
+      )
+    }
+    let padding = (0..<200).map { "filler\($0)" }.joined(separator: " ")
+    try await store.upsertChunk(
+      id: "target", fileId: "f1", startLine: 50, endLine: 60,
+      text: "commonterm " + padding, tokenCount: 200,
+      constructType: nil, constructName: nil, metadata: nil
+    )
+    try await store.markTextIndexComplete(repoId: "noise")
+
+    let outcome = try await store.searchText(query: "commonterm", repoPath: "/r", limit: 5)
+    #expect(outcome.ranking == .bm25)
+    #expect(
+      outcome.results.count == 1,
+      "the in-scope hit must surface even though 401 better-ranked matches are out of scope"
+    )
+  }
+
   // MARK: - Explicit substring mode
 
   @Test("searchSubstring matches mid-identifier fragments")

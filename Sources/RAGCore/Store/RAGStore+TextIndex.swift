@@ -52,19 +52,31 @@ extension RAGStore {
 
   // MARK: - Connection setup
 
-  /// Register the `code_tokens(x)` scalar used by the FTS triggers and the
-  /// backfill. Must run before any statement that can fire those triggers.
+  /// Prepare a raw connection for writes to `chunks`. PUBLIC AND
+  /// LOAD-BEARING for out-of-package writers: the FTS triggers are
+  /// persistent schema objects, so EVERY connection that inserts into
+  /// `chunks` — or updates its text, construct_name, ai_summary, or
+  /// file_id — needs both halves of this:
   ///
-  /// PUBLIC ON PURPOSE, and load-bearing for out-of-process writers: the
-  /// triggers are persistent schema objects, so EVERY connection that
-  /// inserts into `chunks` — or updates its text, construct_name,
-  /// ai_summary, or file_id — must have this function registered, or SQLite
-  /// fails the write with "no such function: code_tokens". A host app that
-  /// opens raw connections to the store file for writing (Peel's overlay
-  /// sync, secret scrubbing, and quality scanning do) must call this on each
-  /// such connection right after opening it. Read-only connections and
-  /// deletes never need it.
-  public static func registerCodeTokens(on handle: OpaquePointer) throws {
+  /// - the `code_tokens()` function registered, or the write fails with
+  ///   "no such function: code_tokens";
+  /// - `PRAGMA recursive_triggers=ON` (it is PER-CONNECTION), or an
+  ///   `INSERT OR REPLACE` that displaces a row never fires the delete
+  ///   trigger for the displaced rowid — the replacement takes a fresh
+  ///   implicit rowid, so the old rowid's postings become silent ghosts.
+  ///
+  /// A host app that opens raw connections to the store file for writing
+  /// (Peel's overlay sync, secret scrubbing, and quality scanning do) must
+  /// call this on each such connection right after opening it. Read-only
+  /// connections and delete-only paths never need it.
+  public static func prepareChunkWriter(on handle: OpaquePointer) throws {
+    try registerCodeTokens(on: handle)
+    guard sqlite3_exec(handle, "PRAGMA recursive_triggers=ON", nil, nil, nil) == SQLITE_OK else {
+      throw RAGError.sqlite("Cannot enable recursive_triggers")
+    }
+  }
+
+  internal static func registerCodeTokens(on handle: OpaquePointer) throws {
     let flags = SQLITE_UTF8 | SQLITE_DETERMINISTIC
     let rc = sqlite3_create_function_v2(
       handle, "code_tokens", 1, flags, nil,
@@ -210,8 +222,15 @@ extension RAGStore {
   /// backfilled. Runs inside the calling task on the store actor; the cost is
   /// proportional to the UNCOVERED rows only, so a store that stays current
   /// pays nothing.
+  ///
+  /// `full: true` drops every posting in scope first and re-derives it. That
+  /// is the repair for STALE postings, which no verification can detect
+  /// (rowids present, content wrong) — required after anything that renumbers
+  /// implicit rowids (VACUUM, a chunks table rebuild; neither exists in this
+  /// codebase today, and whoever adds one owes this call) or after writes
+  /// from a connection that skipped prepareChunkWriter.
   @discardableResult
-  public func rebuildTextIndex(repoPath: String? = nil) async throws -> Int {
+  public func rebuildTextIndex(repoPath: String? = nil, full: Bool = false) async throws -> Int {
     try openIfNeeded()
     try ensureSchema()
     let resolvedRepoId: String?
@@ -221,12 +240,36 @@ extension RAGStore {
     } else {
       resolvedRepoId = nil
     }
+    if full {
+      if let resolvedRepoId {
+        try execute(sql: """
+          DELETE FROM chunks_fts WHERE rowid IN (
+            SELECT chunks.rowid FROM chunks
+            JOIN files ON files.id = chunks.file_id
+            WHERE files.repo_id = ?
+          )
+          """) { stmt in
+          bindText(stmt, 1, resolvedRepoId)
+        }
+      } else {
+        try exec("DELETE FROM chunks_fts")
+      }
+    }
     return try backfillTextIndex(resolvedRepoId: resolvedRepoId)
   }
 
   @discardableResult
   internal func backfillTextIndex(resolvedRepoId: String?) throws -> Int {
     guard let db else { throw RAGError.sqlite("Database not initialized") }
+    // Ghost purge: postings whose chunk no longer exists. Explicit DELETEs
+    // fire the delete trigger on every connection, but a REPLACE on a
+    // connection that skipped prepareChunkWriter strands the displaced
+    // rowid's postings; purging here makes every backfill a repair, so
+    // ghosts cannot accumulate past one index pass.
+    try exec("""
+      DELETE FROM chunks_fts
+      WHERE rowid NOT IN (SELECT rowid FROM chunks)
+      """)
     var sql = """
       INSERT INTO chunks_fts(rowid, text, construct_name, ai_summary, path)
       SELECT chunks.rowid,
@@ -269,39 +312,48 @@ extension RAGStore {
   ) throws -> [RAGSearchResult] {
     // Repo and module filters apply after the rowid join, so the MATCH window
     // must be wider than the limit or a scoped search could starve on hits
-    // that belong to other repos. One escalation retry covers the pathological
-    // case (a common term dominated by out-of-scope repos) without making
-    // every query pay for it.
+    // that belong to other repos. Escalation ends UNBOUNDED: a capped final
+    // pass could silently drop in-scope hits on a common term dominated by
+    // out-of-scope repos, and an honest ranking cannot under-fill without
+    // saying so. The unbounded pass runs only when two capped passes both
+    // under-filled, which needs a pathological corpus shape to reach.
     let filtered = resolvedRepoId != nil || modulePath != nil
     let firstWindow = filtered ? max(limit * 20, 400) : max(limit, 1)
     let results = try runBM25Query(
       matchExpression: matchExpression, resolvedRepoId: resolvedRepoId,
       limit: limit, modulePath: modulePath, window: firstWindow
     )
-    if filtered, results.count < limit {
-      let escalated = try runBM25Query(
-        matchExpression: matchExpression, resolvedRepoId: resolvedRepoId,
-        limit: limit, modulePath: modulePath, window: max(firstWindow * 25, 10_000)
-      )
-      if escalated.count > results.count { return escalated }
-    }
-    return results
+    guard filtered, results.count < limit else { return results }
+    let escalated = try runBM25Query(
+      matchExpression: matchExpression, resolvedRepoId: resolvedRepoId,
+      limit: limit, modulePath: modulePath, window: max(firstWindow * 25, 10_000)
+    )
+    guard escalated.count < limit else { return escalated }
+    let unbounded = try runBM25Query(
+      matchExpression: matchExpression, resolvedRepoId: resolvedRepoId,
+      limit: limit, modulePath: modulePath, window: nil
+    )
+    return unbounded.count > escalated.count ? unbounded : escalated
   }
 
+  /// - Parameter window: candidate-pool cap for the MATCH CTE; nil ranks the
+  ///   complete match set (the honest last resort when capped passes
+  ///   under-fill a filtered search).
   private func runBM25Query(
     matchExpression: String,
     resolvedRepoId: String?,
     limit: Int,
     modulePath: String?,
-    window: Int
+    window: Int?
   ) throws -> [RAGSearchResult] {
+    let windowClause = window != nil ? "LIMIT ?" : ""
     var sql = """
       WITH matched AS (
         SELECT rowid, bm25(chunks_fts, \(Self.bm25Weights)) AS rank_score
         FROM chunks_fts
         WHERE chunks_fts MATCH ?
         ORDER BY rank_score
-        LIMIT ?
+        \(windowClause)
       )
       SELECT repos.root_path || '/' || files.path, chunks.start_line, chunks.end_line, chunks.text,
              chunks.construct_type, chunks.construct_name, files.language, files.module_path, files.feature_tags,
@@ -322,8 +374,10 @@ extension RAGStore {
       var bindIndex: Int32 = 1
       bindText(stmt, bindIndex, matchExpression)
       bindIndex += 1
-      sqlite3_bind_int(stmt, bindIndex, Int32(max(1, window)))
-      bindIndex += 1
+      if let window {
+        sqlite3_bind_int(stmt, bindIndex, Int32(max(1, window)))
+        bindIndex += 1
+      }
       if let resolvedRepoId {
         bindText(stmt, bindIndex, resolvedRepoId)
         bindIndex += 1

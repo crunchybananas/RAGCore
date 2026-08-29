@@ -44,13 +44,11 @@ extension RAGStore {
       try exec("PRAGMA busy_timeout=5000")
       try exec("PRAGMA mmap_size=0")
 
-      // The FTS maintenance triggers call this function, so it must exist on
-      // the connection before anything can write to `chunks`. And REPLACE
-      // must fire the delete trigger for the row it displaces, or an
-      // INSERT OR REPLACE that changes a chunk's rowid strands the old
-      // rowid's postings in the index forever.
-      try Self.registerCodeTokens(on: handle)
-      try exec("PRAGMA recursive_triggers=ON")
+      // The FTS maintenance triggers call code_tokens(), so it must exist on
+      // the connection before anything can write to `chunks`, and REPLACE
+      // must fire the delete trigger for the row it displaces (see
+      // prepareChunkWriter — external writers need the same two steps).
+      try Self.prepareChunkWriter(on: handle)
 
       let compiledVersion = String(cString: sqlite_vec_compiled_version())
       guard let runtimeVersion = try queryString("SELECT vec_version()") else {
