@@ -88,13 +88,44 @@ struct TextIndexFTSTests {
 
   @Test("matchExpression quotes terms so FTS5 operators are literals")
   func matchExpressionNeutralizesOperators() {
+    // Discriminating terms carry the prefix star (outside the quotes, so it
+    // is the operator, not a literal); a term whose final token is short
+    // stays exact - `x*` would flood the candidate window.
     let expr = CodeTokens.matchExpression(for: "repo NEAR term-x", matchAll: true)
-    #expect(expr == "\"repo\" AND \"NEAR\" AND \"term-x\"")
+    #expect(expr == "\"repo\"* AND \"NEAR\"* AND \"term-x\"")
     // Pure punctuation has nothing to rank.
     #expect(CodeTokens.matchExpression(for: "-- ***", matchAll: true) == nil)
-    // camelCase words expand to the exact form OR the split phrase.
+    // camelCase words expand to the exact form OR the split phrase, each
+    // prefix-matched (the phrase star applies to its last token).
     let camel = CodeTokens.matchExpression(for: "resolveRepo", matchAll: true)
-    #expect(camel == "(\"resolveRepo\" OR \"resolve repo\")")
+    #expect(camel == "(\"resolveRepo\"* OR \"resolve repo\"*)")
+  }
+
+  @Test("prefix expansion recovers substring-era recall for word forms")
+  func prefixExpansionMatchesLongerForms() async throws {
+    let store = try await makeStore()
+    try await seed(store)
+    try await store.upsertFile(
+      id: "f4", repoId: "r", path: "Sources/App/Layouts.swift", hash: "h4",
+      language: "swift", updatedAt: "2026-01-01", modulePath: "Sources/App", featureTags: nil
+    )
+    try await store.upsertChunk(
+      id: "c4", fileId: "f4", startLine: 1, endLine: 3,
+      text: "let chipLayouts = wrappingLayouts.filter { $0.isChip }",
+      tokenCount: 8, constructType: nil, constructName: nil, metadata: nil
+    )
+    // Singular query, plural identifier: LIKE matched this by substring;
+    // BM25 needs the prefix star to keep it.
+    let plural = try await store.searchText(query: "layout", repoPath: "/r", limit: 10)
+    #expect(plural.ranking == .bm25)
+    #expect(plural.results.count == 1)
+    // Identifier-prefix query finds the longer camelCase identifier too.
+    let longer = try await store.searchText(query: "chipLayout", repoPath: "/r", limit: 10)
+    #expect(longer.results.count == 1)
+    // The short-token guard holds: a 3-character fragment stays exact and
+    // must NOT prefix-flood into `zebra`.
+    let short = try await store.searchText(query: "zeb", repoPath: "/r", limit: 10)
+    #expect(short.results.isEmpty)
   }
 
   // MARK: - Ranking
