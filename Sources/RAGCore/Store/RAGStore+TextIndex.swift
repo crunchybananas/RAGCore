@@ -54,7 +54,17 @@ extension RAGStore {
 
   /// Register the `code_tokens(x)` scalar used by the FTS triggers and the
   /// backfill. Must run before any statement that can fire those triggers.
-  internal static func registerCodeTokens(on handle: OpaquePointer) throws {
+  ///
+  /// PUBLIC ON PURPOSE, and load-bearing for out-of-process writers: the
+  /// triggers are persistent schema objects, so EVERY connection that
+  /// inserts into `chunks` — or updates its text, construct_name,
+  /// ai_summary, or file_id — must have this function registered, or SQLite
+  /// fails the write with "no such function: code_tokens". A host app that
+  /// opens raw connections to the store file for writing (Peel's overlay
+  /// sync, secret scrubbing, and quality scanning do) must call this on each
+  /// such connection right after opening it. Read-only connections and
+  /// deletes never need it.
+  public static func registerCodeTokens(on handle: OpaquePointer) throws {
     let flags = SQLITE_UTF8 | SQLITE_DETERMINISTIC
     let rc = sqlite3_create_function_v2(
       handle, "code_tokens", 1, flags, nil,
