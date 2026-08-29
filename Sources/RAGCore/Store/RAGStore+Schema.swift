@@ -2,7 +2,7 @@
 //  RAGStore+Schema.swift
 //  RAGCore
 //
-//  Schema management and migrations (v1→v22).
+//  Schema management and migrations (v1→v23).
 //
 
 import CSQLite
@@ -43,6 +43,12 @@ extension RAGStore {
       try exec("PRAGMA journal_mode=DELETE")
       try exec("PRAGMA busy_timeout=5000")
       try exec("PRAGMA mmap_size=0")
+
+      // The FTS maintenance triggers call code_tokens(), so it must exist on
+      // the connection before anything can write to `chunks`, and REPLACE
+      // must fire the delete trigger for the row it displaces (see
+      // prepareChunkWriter — external writers need the same two steps).
+      try Self.prepareChunkWriter(on: handle)
 
       let compiledVersion = String(cString: sqlite_vec_compiled_version())
       guard let runtimeVersion = try queryString("SELECT vec_version()") else {
@@ -561,6 +567,20 @@ extension RAGStore {
         """)
       try exec("CREATE INDEX IF NOT EXISTS idx_staged_chunk_analysis_chunk ON staged_chunk_analysis(chunk_id)")
       try setSchemaVersion(22)
+    }
+
+    if schemaVersion < 23 {
+      // Real lexical ranking (cloke/peel#2211): a contentless-delete FTS5
+      // index over chunk text, construct names, AI summaries, and file
+      // paths, maintained by triggers so every chunk write path stays in
+      // sync. Deliberately NOT backfilled here — the v21 precedent stands: a
+      // migration that scans the whole chunks table turns the first launch
+      // after upgrade into a stall. indexRepository and rebuildTextIndex()
+      // fill it per repo, fts_repo_state records which repos are covered,
+      // and text search serves the substring path — flagged, never silently —
+      // for repos still waiting.
+      try createTextIndexSchema()
+      try setSchemaVersion(23)
     }
 
     // Deliberately outside the version gates: a database can reach a high

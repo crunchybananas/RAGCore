@@ -180,9 +180,15 @@ extension RAGStore {
   // MARK: - Search Result Queries
 
   /// Query and map search results from a SQL statement.
+  /// - Parameter scoreColumn: when set, the ranking score is read from this
+  ///   column as a raw double and negated (BM25 reports lower-is-better;
+  ///   `RAGSearchResult.score` is higher-is-better everywhere else). The
+  ///   column sits AFTER the structure columns because those are decoded
+  ///   positionally.
   internal func querySearchResults(
     sql: String,
     withScore: Bool,
+    scoreColumn: Int32? = nil,
     binder: (OpaquePointer) -> Void
   ) throws -> [RAGSearchResult] {
     guard let db else { throw RAGError.sqlite("Database not initialized") }
@@ -234,7 +240,8 @@ extension RAGStore {
         constructName: constructName,
         language: language,
         isTest: isTestFile(filePath),
-        score: withScore ? 0.0 : nil,
+        score: scoreColumn.map { Float(-sqlite3_column_double(stmt, $0)) }
+          ?? (withScore ? 0.0 : nil),
         modulePath: modulePath,
         featureTags: featureTags ?? [],
         aiSummary: aiSummary,

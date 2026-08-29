@@ -15,11 +15,13 @@ import MachO
 /// Core actor for RAG (Retrieval-Augmented Generation) storage.
 ///
 /// Manages:
-/// - SQLite database with schema migrations (v1→v14)
+/// - SQLite database with schema migrations (v1→v23)
 /// - File scanning and chunking pipeline (AST + line-based)
 /// - Embedding generation and caching
 /// - Vector search (accelerated via sqlite-vec, or brute-force fallback)
-/// - Text search (FTS5-based)
+/// - Text search (FTS5 + BM25 with code-aware term expansion; explicit
+///   substring mode, which also serves — flagged — for repos whose lexical
+///   index is not yet backfilled)
 /// - Dependency graph (import/inheritance tracking)
 /// - Lessons learned (agent mistake → fix patterns)
 /// - Query hints (search analytics)
