@@ -500,6 +500,15 @@ extension RAGStore {
       print("[RAG] Pruned \(filesRemovedCount) deleted files from index")
     }
 
+    // Lexical index (#2211): the triggers covered every chunk this run wrote;
+    // the backfill covers chunks of UNCHANGED files that predate the FTS
+    // migration. Cost is proportional to the uncovered rows, so a current
+    // repo pays one no-op statement here.
+    let ftsBackfilled = try backfillTextIndex(resolvedRepoId: repoId)
+    if ftsBackfilled > 0 {
+      print("[RAG] Backfilled \(ftsBackfilled) chunks into the lexical index")
+    }
+
     let durationMs = Int(Date().timeIntervalSince(startTime) * 1000)
     let report = RAGIndexReport(
       repoId: repoId,

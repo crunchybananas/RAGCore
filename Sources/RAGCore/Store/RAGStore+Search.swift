@@ -2,7 +2,7 @@
 //  RAGStore+Search.swift
 //  RAGCore
 //
-//  Text (FTS5-like) and vector search methods.
+//  Text (FTS5/BM25 with an explicit substring fallback) and vector search.
 //
 
 import CSQLite
@@ -12,7 +12,32 @@ extension RAGStore {
 
   // MARK: - Text Search
 
-  /// Search by text (keyword matching across code, construct names, and AI summaries).
+  /// Search by text. Ranks with BM25 over the FTS5 lexical index when every
+  /// repo in scope is covered; until then the substring path serves. This
+  /// signature predates the index and returns results only — callers that
+  /// need to know which ranking served (and surface the degraded case) use
+  /// `searchText`.
+  public func search(
+    query: String,
+    repoPath: String? = nil,
+    limit: Int = 10,
+    matchAll: Bool = true,
+    modulePath: String? = nil
+  ) async throws -> [RAGSearchResult] {
+    try await searchText(
+      query: query, repoPath: repoPath, limit: limit,
+      matchAll: matchAll, modulePath: modulePath
+    ).results
+  }
+
+  /// Search by text, reporting which ranking actually served.
+  ///
+  /// BM25 (`bm25()` over the FTS5 index, code-aware term expansion via
+  /// `CodeTokens`) when the scope's lexical index is complete. Substring
+  /// (the historical LIKE scan) when repos still await backfill — with
+  /// `pendingTextIndexRepos` saying how many, so the caller can report the
+  /// degradation instead of presenting alphabetical truncation as ranking —
+  /// or when the query has no term FTS5 can rank (pure punctuation).
   ///
   /// - Parameters:
   ///   - query: Search query string.
@@ -20,8 +45,54 @@ extension RAGStore {
   ///   - limit: Maximum results.
   ///   - matchAll: If true, all words must appear (AND). If false, any word (OR).
   ///   - modulePath: Optional module path filter.
-  /// - Returns: Matching search results.
-  public func search(
+  public func searchText(
+    query: String,
+    repoPath: String? = nil,
+    limit: Int = 10,
+    matchAll: Bool = true,
+    modulePath: String? = nil
+  ) async throws -> RAGTextSearchOutcome {
+    let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedQuery.isEmpty else {
+      return RAGTextSearchOutcome(results: [], ranking: .bm25, pendingTextIndexRepos: 0)
+    }
+    try openIfNeeded()
+    try ensureSchema()
+
+    // Resolve repo identity (path-independent)
+    let resolvedRepoId: String?
+    if let repoPath {
+      resolvedRepoId = try resolveRepo(for: repoPath)?.id
+      guard resolvedRepoId != nil else {
+        return RAGTextSearchOutcome(results: [], ranking: .bm25, pendingTextIndexRepos: 0)
+      }
+    } else {
+      resolvedRepoId = nil
+    }
+
+    let pendingRepos = try textIndexComplete(resolvedRepoId: resolvedRepoId)
+    if pendingRepos == 0,
+       let matchExpression = CodeTokens.matchExpression(for: trimmedQuery, matchAll: matchAll) {
+      let results = try searchBM25(
+        matchExpression: matchExpression,
+        resolvedRepoId: resolvedRepoId,
+        limit: limit,
+        modulePath: modulePath
+      )
+      return RAGTextSearchOutcome(results: results, ranking: .bm25, pendingTextIndexRepos: 0)
+    }
+    let results = try substringSearch(
+      trimmedQuery: trimmedQuery, resolvedRepoId: resolvedRepoId,
+      limit: limit, matchAll: matchAll, modulePath: modulePath
+    )
+    return RAGTextSearchOutcome(
+      results: results, ranking: .substring, pendingTextIndexRepos: pendingRepos
+    )
+  }
+
+  /// The historical LIKE scan as an explicit mode, for callers that
+  /// genuinely want raw substring matching rather than ranked terms.
+  public func searchSubstring(
     query: String,
     repoPath: String? = nil,
     limit: Int = 10,
@@ -31,8 +102,6 @@ extension RAGStore {
     let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmedQuery.isEmpty else { return [] }
     try openIfNeeded()
-
-    // Resolve repo identity (path-independent)
     let resolvedRepoId: String?
     if let repoPath {
       resolvedRepoId = try resolveRepo(for: repoPath)?.id
@@ -40,7 +109,19 @@ extension RAGStore {
     } else {
       resolvedRepoId = nil
     }
+    return try substringSearch(
+      trimmedQuery: trimmedQuery, resolvedRepoId: resolvedRepoId,
+      limit: limit, matchAll: matchAll, modulePath: modulePath
+    )
+  }
 
+  private func substringSearch(
+    trimmedQuery: String,
+    resolvedRepoId: String?,
+    limit: Int,
+    matchAll: Bool,
+    modulePath: String?
+  ) throws -> [RAGSearchResult] {
     let words = trimmedQuery
       .components(separatedBy: .whitespacesAndNewlines)
       .filter { !$0.isEmpty }
