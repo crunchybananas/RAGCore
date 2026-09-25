@@ -427,7 +427,7 @@ extension RAGStore {
       let language = sqlite3_column_text(statement, 6).map { String(cString: $0) }
       let modulePath = sqlite3_column_text(statement, 7).map { String(cString: $0) }
       let featureTagsJSON = sqlite3_column_text(statement, 8).map { String(cString: $0) }
-      let aiSummary = sqlite3_column_text(statement, 9).map { String(cString: $0) }
+      let aiSummary = sqlite3_column_text(statement, 9).map { String(cString: $0) }.flatMap(RAGStore.usableSummary)
       let aiTagsJSON = sqlite3_column_text(statement, 10).map { String(cString: $0) }
       let tokenCount = Int(sqlite3_column_int(statement, 11))
       let similarity = max(0, 1.0 - Float(sqlite3_column_double(statement, 12)))

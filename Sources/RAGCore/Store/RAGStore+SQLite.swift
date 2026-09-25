@@ -152,7 +152,7 @@ extension RAGStore {
       let language = sqlite3_column_text(stmt, 8).map { String(cString: $0) }
       let modulePath = sqlite3_column_text(stmt, 9).map { String(cString: $0) }
       let featureTags = sqlite3_column_text(stmt, 10).map { String(cString: $0) }
-      let aiSummary = sqlite3_column_text(stmt, 11).map { String(cString: $0) }
+      let aiSummary = sqlite3_column_text(stmt, 11).map { String(cString: $0) }.flatMap(RAGStore.usableSummary)
       let tokenCount = Int(sqlite3_column_int(stmt, 12))
       let structure = decodeStructureMetrics(stmt, firstColumn: 13)
       _ = aiSummary // used by caller via querySearchResults
@@ -212,7 +212,7 @@ extension RAGStore {
       let language = sqlite3_column_text(stmt, 6).map { String(cString: $0) }
       let modulePath = sqlite3_column_text(stmt, 7).map { String(cString: $0) }
       let featureTagsJson = sqlite3_column_text(stmt, 8).map { String(cString: $0) }
-      let aiSummary = sqlite3_column_text(stmt, 9).map { String(cString: $0) }
+      let aiSummary = sqlite3_column_text(stmt, 9).map { String(cString: $0) }.flatMap(RAGStore.usableSummary)
       let aiTagsJson = sqlite3_column_text(stmt, 10).map { String(cString: $0) }
       let tokenCount = Int(sqlite3_column_int(stmt, 11))
       let structure = decodeStructureMetrics(stmt, firstColumn: 12)

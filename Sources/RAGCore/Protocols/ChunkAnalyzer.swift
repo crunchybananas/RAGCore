@@ -37,8 +37,47 @@ public protocol ChunkAnalyzer: Sendable {
     language: String?
   ) async throws -> ChunkAnalysis
 
+  /// Analyze a code chunk with the full context the store knows about it,
+  /// including where the chunk lives. The store always calls this overload.
+  ///
+  /// The default forwards to the context-free overload, so an existing
+  /// analyzer keeps working unchanged. Implement it to use the file path:
+  /// without it a summary cannot say which feature or screen the code belongs
+  /// to, and a model left to guess fills that gap with invention.
+  func analyze(chunk: String, context: ChunkAnalysisContext) async throws -> ChunkAnalysis
+
   /// A human-readable name for the analyzer model (for logging/display).
   var analyzerName: String { get }
+}
+
+extension ChunkAnalyzer {
+  public func analyze(chunk: String, context: ChunkAnalysisContext) async throws -> ChunkAnalysis {
+    try await analyze(
+      chunk: chunk,
+      constructType: context.constructType,
+      constructName: context.constructName,
+      language: context.language
+    )
+  }
+}
+
+/// Everything the store knows about a chunk besides its text.
+public struct ChunkAnalysisContext: Sendable, Equatable {
+  /// The file's path relative to its repository root, e.g. "Sources/App/Auth/Login.swift".
+  public let filePath: String?
+  /// The AST construct type (e.g., "classDecl", "function", "imports"), if known.
+  public let constructType: String?
+  /// The construct's name (e.g., "UserService", "Cart (part 2/3)"), if known.
+  public let constructName: String?
+  /// The language label the scanner assigned (e.g., "Swift", "YAML"), if known.
+  public let language: String?
+
+  public init(filePath: String?, constructType: String?, constructName: String?, language: String?) {
+    self.filePath = filePath
+    self.constructType = constructType
+    self.constructName = constructName
+    self.language = language
+  }
 }
 
 /// Result of AI analysis on a code chunk.
