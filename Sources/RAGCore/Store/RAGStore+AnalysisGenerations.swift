@@ -131,10 +131,11 @@ extension RAGStore {
       let constructType: String?
       let constructName: String?
       let language: String?
+      let filePath: String?
     }
 
     let sql = """
-      SELECT c.id, c.text, c.construct_type, c.construct_name, f.language
+      SELECT c.id, c.text, c.construct_type, c.construct_name, f.language, f.path
       FROM chunks c
       JOIN files f ON f.id = c.file_id
       WHERE f.repo_id = ?
@@ -163,7 +164,8 @@ extension RAGStore {
         text: String(cString: sqlite3_column_text(statement, 1)),
         constructType: sqlite3_column_text(statement, 2).map { String(cString: $0) },
         constructName: sqlite3_column_text(statement, 3).map { String(cString: $0) },
-        language: sqlite3_column_text(statement, 4).map { String(cString: $0) }
+        language: sqlite3_column_text(statement, 4).map { String(cString: $0) },
+        filePath: sqlite3_column_text(statement, 5).map { String(cString: $0) }
       ))
     }
     guard !pending.isEmpty else { return 0 }
@@ -175,9 +177,12 @@ extension RAGStore {
       do {
         let analysis = try await chunkAnalyzer.analyze(
           chunk: chunk.text,
-          constructType: chunk.constructType,
-          constructName: chunk.constructName,
-          language: chunk.language
+          context: ChunkAnalysisContext(
+            filePath: chunk.filePath,
+            constructType: chunk.constructType,
+            constructName: chunk.constructName,
+            language: chunk.language
+          )
         )
         let tags = try? JSONEncoder().encode(analysis.tags)
         let tagsJSON = tags.flatMap { String(data: $0, encoding: .utf8) }
@@ -224,9 +229,11 @@ extension RAGStore {
       let chunkId: String
       let text: String
       let summary: String
+      let filePath: String?
+      let constructName: String?
     }
     let sql = """
-      SELECT s.chunk_id, c.text, s.ai_summary
+      SELECT s.chunk_id, c.text, s.ai_summary, f.path, c.construct_name
       FROM staged_chunk_analysis s
       JOIN chunks c ON c.id = s.chunk_id
       JOIN files f ON f.id = c.file_id
@@ -250,11 +257,15 @@ extension RAGStore {
       pending.append(PendingEmbedding(
         chunkId: String(cString: sqlite3_column_text(statement, 0)),
         text: String(cString: sqlite3_column_text(statement, 1)),
-        summary: String(cString: sqlite3_column_text(statement, 2))
+        summary: String(cString: sqlite3_column_text(statement, 2)),
+        filePath: sqlite3_column_text(statement, 3).map { String(cString: $0) },
+        constructName: sqlite3_column_text(statement, 4).map { String(cString: $0) }
       ))
     }
 
-    let enrichedTexts = pending.map { "\($0.text)\n\n// AI Summary: \($0.summary)" }
+    let enrichedTexts = pending.map {
+      Self.enrichedEmbeddingText(code: $0.text, summary: $0.summary, filePath: $0.filePath, constructName: $0.constructName)
+    }
     var enriched = 0
     for range in Self.embedBatchRanges(for: enrichedTexts) {
       try Task.checkCancellation()

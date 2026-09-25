@@ -12,6 +12,14 @@ extension RAGStore {
   private static let failedAnalysisSummary = "[analysis-failed]"
   private static let failedAnalysisModel = "chunk-analyzer-failed"
 
+  /// A stored summary fit to show a searcher, or nil. Filters the legacy
+  /// failure sentinel, which v24 removes from local rows but an older peer's
+  /// overlay export can still deliver.
+  static func usableSummary(_ summary: String) -> String? {
+    let trimmed = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty || trimmed == failedAnalysisSummary ? nil : summary
+  }
+
   // MARK: - AI Chunk Analysis
 
   /// Analyze un-analyzed chunks using the configured `ChunkAnalyzer`.
@@ -33,7 +41,7 @@ extension RAGStore {
     if let repoPath {
       resolvedRepoId = try resolveRepoId(for: repoPath)
       sql = """
-        SELECT c.id, c.text, c.construct_type, c.construct_name, f.language
+        SELECT c.id, c.text, c.construct_type, c.construct_name, f.language, f.path
         FROM chunks c
         JOIN files f ON c.file_id = f.id
         JOIN repos r ON f.repo_id = r.id
@@ -43,7 +51,7 @@ extension RAGStore {
     } else {
       resolvedRepoId = nil
       sql = """
-        SELECT c.id, c.text, c.construct_type, c.construct_name, f.language
+        SELECT c.id, c.text, c.construct_type, c.construct_name, f.language, f.path
         FROM chunks c
         JOIN files f ON c.file_id = f.id
         WHERE c.ai_summary IS NULL OR c.analyzer_model = ? OR c.ai_summary = ?
@@ -73,6 +81,7 @@ extension RAGStore {
       let constructType: String?
       let constructName: String?
       let language: String?
+      let filePath: String?
     }
 
     var chunksToAnalyze: [ChunkToAnalyze] = []
@@ -82,7 +91,11 @@ extension RAGStore {
       let constructType = sqlite3_column_text(statement, 2).map { String(cString: $0) }
       let constructName = sqlite3_column_text(statement, 3).map { String(cString: $0) }
       let language = sqlite3_column_text(statement, 4).map { String(cString: $0) }
-      chunksToAnalyze.append(ChunkToAnalyze(id: id, text: text, constructType: constructType, constructName: constructName, language: language))
+      let filePath = sqlite3_column_text(statement, 5).map { String(cString: $0) }
+      chunksToAnalyze.append(ChunkToAnalyze(
+        id: id, text: text, constructType: constructType, constructName: constructName,
+        language: language, filePath: filePath
+      ))
     }
 
     guard !chunksToAnalyze.isEmpty else { return 0 }
@@ -96,9 +109,12 @@ extension RAGStore {
       do {
         let analysis = try await chunkAnalyzer.analyze(
           chunk: chunk.text,
-          constructType: chunk.constructType,
-          constructName: chunk.constructName,
-          language: chunk.language
+          context: ChunkAnalysisContext(
+            filePath: chunk.filePath,
+            constructType: chunk.constructType,
+            constructName: chunk.constructName,
+            language: chunk.language
+          )
         )
 
         let tagsJson = (try? JSONEncoder().encode(analysis.tags)).flatMap { String(data: $0, encoding: .utf8) }
@@ -114,10 +130,13 @@ extension RAGStore {
       } catch {
         print("[RAG] Chunk analysis failed for \(chunk.id): \(error)")
         // Persist the failure, but keep it retryable in later analyze passes.
+        // The marker lives in analyzer_model only: a sentinel string stored as
+        // the summary was served to searchers as if it were one and indexed
+        // for keyword search, where "failed" matched every broken chunk.
         try? updateChunkAnalysis(
           chunkId: chunk.id,
           chunkText: chunk.text,
-          aiSummary: Self.failedAnalysisSummary,
+          aiSummary: nil,
           aiTags: nil,
           analyzedAt: now,
           analyzerModel: Self.failedAnalysisModel
@@ -132,7 +151,7 @@ extension RAGStore {
   internal func updateChunkAnalysis(
     chunkId: String,
     chunkText: String,
-    aiSummary: String,
+    aiSummary: String?,
     aiTags: String?,
     analyzedAt: String,
     analyzerModel: String
@@ -143,7 +162,7 @@ extension RAGStore {
       WHERE id = ?
       """
     try execute(sql: sql) { stmt in
-      bindText(stmt, 1, aiSummary)
+      bindTextOrNull(stmt, 1, aiSummary)
       bindTextOrNull(stmt, 2, aiTags)
       bindText(stmt, 3, analyzedAt)
       bindText(stmt, 4, analyzerModel)
@@ -158,12 +177,12 @@ extension RAGStore {
     try execute(sql: insertAnalysis) { stmt in
       bindText(stmt, 1, chunkId)
       bindText(stmt, 2, analyzerModel)
-      bindText(stmt, 3, aiSummary)
+      bindTextOrNull(stmt, 3, aiSummary)
       bindTextOrNull(stmt, 4, aiTags)
       bindText(stmt, 5, analyzedAt)
     }
 
-    guard analyzerModel != Self.failedAnalysisModel, aiSummary != Self.failedAnalysisSummary else {
+    guard analyzerModel != Self.failedAnalysisModel, let aiSummary, aiSummary != Self.failedAnalysisSummary else {
       return
     }
 
@@ -238,6 +257,26 @@ extension RAGStore {
 
   // MARK: - Embedding Enrichment
 
+  /// The text an analyzed chunk is re-embedded from: where it lives, what it
+  /// does, then the code.
+  ///
+  /// The summary leads because embedding providers cap their input (8,000
+  /// characters for qwen3-embedding, 2,000 for others) and cut from the END.
+  /// Appended after the code (the old layout), a summary was the first thing
+  /// dropped from exactly the large chunks that need it most. Every chunk over
+  /// the cap was embedded as if it had never been analyzed. The path and
+  /// construct name carry the feature vocabulary ("checkout", "billing",
+  /// "LoginForm") that a searcher types and the code alone often lacks.
+  static func enrichedEmbeddingText(code: String, summary: String, filePath: String?, constructName: String?) -> String {
+    var header: [String] = []
+    if let filePath, !filePath.isEmpty { header.append("File: \(filePath)") }
+    if let constructName, !constructName.isEmpty, constructName != "imports" {
+      header.append("Construct: \(constructName)")
+    }
+    header.append("Summary: \(summary)")
+    return header.joined(separator: "\n") + "\n\n" + code
+  }
+
   /// Re-embed analyzed chunks using enriched text (code + AI summary).
   /// This makes vector search capture both code structure AND semantic meaning.
   public func enrichEmbeddings(
@@ -252,7 +291,7 @@ extension RAGStore {
     if let repoPath {
       resolvedRepoId = try resolveRepoId(for: repoPath)
       sql = """
-        SELECT c.id, c.text, c.ai_summary FROM chunks c
+        SELECT c.id, c.text, c.ai_summary, f.path, c.construct_name FROM chunks c
         JOIN files f ON c.file_id = f.id JOIN repos r ON f.repo_id = r.id
         WHERE c.ai_summary IS NOT NULL
           AND c.analyzer_model != ?
@@ -264,7 +303,8 @@ extension RAGStore {
     } else {
       resolvedRepoId = nil
       sql = """
-        SELECT c.id, c.text, c.ai_summary FROM chunks c
+        SELECT c.id, c.text, c.ai_summary, f.path, c.construct_name FROM chunks c
+        JOIN files f ON c.file_id = f.id
         WHERE c.ai_summary IS NOT NULL
           AND c.analyzer_model != ?
           AND c.ai_summary != ?
@@ -289,18 +329,22 @@ extension RAGStore {
     if let resolvedRepoId { bindText(statement, bindIndex, resolvedRepoId); bindIndex += 1 }
     sqlite3_bind_int(statement, bindIndex, Int32(limit))
 
-    struct ChunkToEnrich { let id: String; let text: String; let aiSummary: String }
+    struct ChunkToEnrich { let id: String; let text: String; let aiSummary: String; let filePath: String?; let constructName: String? }
     var chunks: [ChunkToEnrich] = []
     while sqlite3_step(statement) == SQLITE_ROW {
       let id = String(cString: sqlite3_column_text(statement, 0))
       let text = String(cString: sqlite3_column_text(statement, 1))
       let summary = String(cString: sqlite3_column_text(statement, 2))
-      chunks.append(ChunkToEnrich(id: id, text: text, aiSummary: summary))
+      let filePath = sqlite3_column_text(statement, 3).map { String(cString: $0) }
+      let constructName = sqlite3_column_text(statement, 4).map { String(cString: $0) }
+      chunks.append(ChunkToEnrich(id: id, text: text, aiSummary: summary, filePath: filePath, constructName: constructName))
     }
 
     guard !chunks.isEmpty else { return 0 }
 
-    let enrichedTexts = chunks.map { "\($0.text)\n\n// AI Summary: \($0.aiSummary)" }
+    let enrichedTexts = chunks.map {
+      Self.enrichedEmbeddingText(code: $0.text, summary: $0.aiSummary, filePath: $0.filePath, constructName: $0.constructName)
+    }
     var enrichedCount = 0
     let now = dateFormatter.string(from: Date())
 

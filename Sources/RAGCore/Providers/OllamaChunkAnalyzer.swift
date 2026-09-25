@@ -68,38 +68,74 @@ public actor OllamaChunkAnalyzer: ChunkAnalyzer {
     constructName: String?,
     language: String?
   ) async throws -> ChunkAnalysis {
-    let prompt = buildPrompt(chunk: chunk, constructType: constructType, constructName: constructName, language: language)
+    try await analyze(
+      chunk: chunk,
+      context: ChunkAnalysisContext(
+        filePath: nil, constructType: constructType, constructName: constructName, language: language
+      )
+    )
+  }
 
-    let systemPrompt = """
-    You are a code analyzer. Given a code chunk, produce a JSON object with:
-    - "summary": A concise 1-2 sentence description of what this code does and why.
-    - "tags": An array of 2-5 semantic tags (lowercase, hyphenated) describing the code's purpose.
+  public func analyze(chunk: String, context: ChunkAnalysisContext) async throws -> ChunkAnalysis {
+    let prompt = ChunkAnalysisPrompt.userMessage(chunk: chunk, context: context)
+    // Qwen3 extended thinking mode produces verbose output, so disable it.
+    let userContent = Self.wantsNoThinkPrefix(model: model) ? "/no_think\n\(prompt)" : prompt
 
-    Respond with ONLY the JSON object, no markdown fences, no explanation.
-    Example: {"summary": "Validates user email format and checks for duplicates", "tags": ["validation", "email", "user-input"]}
-    """
+    let content: String
+    do {
+      content = try await chat(userContent: userContent, format: structuredOutputRejected ? "json" : ChunkAnalysisPrompt.responseSchema)
+    } catch OllamaError.httpError(let code, _) where code == 400 && !structuredOutputRejected {
+      // An Ollama that predates JSON-schema `format` rejects the object form.
+      // Plain JSON mode is still constrained decoding; remember and move on.
+      structuredOutputRejected = true
+      content = try await chat(userContent: userContent, format: "json")
+    }
 
+    if let analysis = try? ChunkAnalysisResponseParser.parse(content) { return analysis }
+
+    // One immediate second attempt at a higher temperature: an unusable reply
+    // is usually a degenerate decode (a repetition loop that ran into the
+    // token budget), and the same prompt at 0.1 tends to reproduce it. A
+    // staged converge cannot commit while any chunk lacks a result, so a
+    // chunk that fails every pass would hold the whole corpus back.
+    let retry = try await chat(
+      userContent: userContent, format: structuredOutputRejected ? "json" : ChunkAnalysisPrompt.responseSchema,
+      temperature: 0.5
+    )
+    do {
+      return try ChunkAnalysisResponseParser.parse(retry)
+    } catch {
+      // Thrown, not stored: the store records a retryable failure instead of
+      // indexing a fragment of the raw reply as if it were a summary.
+      throw OllamaError.invalidResponse(error.localizedDescription)
+    }
+  }
+
+  /// Whether this server refused a JSON-schema `format` (Ollama < 0.5).
+  private var structuredOutputRejected = false
+
+  private func chat(userContent: String, format: Any, temperature: Double = 0.1) async throws -> String {
     let url = URL(string: "\(baseURL)/api/chat")!
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.timeoutInterval = requestTimeout
 
-    // Qwen3 extended thinking mode produces verbose output — disable it
-    let userContent = Self.wantsNoThinkPrefix(model: model) ? "/no_think\n\(prompt)" : prompt
-
     let body: [String: Any] = [
       "model": model,
       "messages": [
-        ["role": "system", "content": systemPrompt],
+        ["role": "system", "content": ChunkAnalysisPrompt.systemPrompt],
         ["role": "user", "content": userContent],
       ],
       "stream": false,
+      // Structured output: the reply is decoded against the schema, so it is
+      // always one complete JSON object with a summary and tags.
+      "format": format,
       // Hold the model resident for the run's duration; server-default
       // keep-alive (5m) is what evicted it between batches (#22).
       "keep_alive": keepAlive,
       "options": [
-        "temperature": 0.1,
+        "temperature": temperature,
         "num_predict": 512,
       ],
     ]
@@ -122,46 +158,9 @@ public actor OllamaChunkAnalyzer: ChunkAnalyzer {
 
     guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let message = json["message"] as? [String: Any],
-          var content = message["content"] as? String else {
+          let content = message["content"] as? String else {
       throw OllamaError.invalidResponse("Invalid chat response")
     }
-
-    // Strip thinking tags if present (Qwen3)
-    if content.contains("<think>") {
-      content = content.replacingOccurrences(
-        of: #"<think>[\s\S]*?</think>"#, with: "", options: .regularExpression
-      ).trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    return parseAnalysis(content)
-  }
-
-  private func buildPrompt(chunk: String, constructType: String?, constructName: String?, language: String?) -> String {
-    var parts: [String] = []
-    if let lang = language { parts.append("Language: \(lang)") }
-    if let ct = constructType { parts.append("Type: \(ct)") }
-    if let cn = constructName { parts.append("Name: \(cn)") }
-    parts.append("Code:\n\(String(chunk.prefix(3000)))")
-    return parts.joined(separator: "\n")
-  }
-
-  private func parseAnalysis(_ content: String) -> ChunkAnalysis {
-    let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-
-    // Strip markdown fences if present
-    var jsonStr = trimmed
-    if jsonStr.hasPrefix("```") {
-      jsonStr = jsonStr.replacingOccurrences(of: #"```(?:json)?\n?"#, with: "", options: .regularExpression)
-    }
-
-    if let data = jsonStr.data(using: .utf8),
-       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-       let summary = json["summary"] as? String {
-      let tags = (json["tags"] as? [String]) ?? []
-      return ChunkAnalysis(summary: summary, tags: tags)
-    }
-
-    // Fallback: use the raw text as summary
-    return ChunkAnalysis(summary: String(trimmed.prefix(200)), tags: [])
+    return content
   }
 }

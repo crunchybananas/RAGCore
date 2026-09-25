@@ -583,6 +583,20 @@ extension RAGStore {
       try setSchemaVersion(23)
     }
 
+    if schemaVersion < 24 {
+      // A failed analysis used to be stored AS the summary: the literal
+      // "[analysis-failed]" went out in search results as if it described the
+      // chunk, into overlay exports that shipped it to every consumer, and
+      // into the keyword index, where any query containing "fail" matched
+      // every broken chunk. Failures are now marked by analyzer_model alone
+      // with a NULL summary, which every retry query already selects. This is
+      // one read-mostly pass over chunks (measured 0.9s on a 2.4 GB, 63k-chunk
+      // store); the FTS update trigger re-indexes only the rows it touches.
+      try exec("UPDATE chunks SET ai_summary = NULL, ai_tags = NULL WHERE ai_summary = '[analysis-failed]'")
+      try exec("UPDATE chunk_analysis SET ai_summary = NULL WHERE ai_summary = '[analysis-failed]'")
+      try setSchemaVersion(24)
+    }
+
     // Deliberately outside the version gates: a database can reach a high
     // schema_version without these indexes — table-rebuild migrations drop
     // secondary indexes, and sync-imported databases arrive with full-shape
