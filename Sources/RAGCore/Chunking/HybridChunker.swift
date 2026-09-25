@@ -18,6 +18,7 @@ import Foundation
 /// - TypeScript/JavaScript/GTS/GJS use JavaScriptCore-based chunker.
 public struct HybridChunker: Sendable {
   private let lineChunker = RAGLineChunker()
+  private let markdownChunker = MarkdownSectionChunker()
   private let rubyChunker: RubyChunker?
   private let glimmerChunker: GlimmerChunker?
   private let jsChunker: JSCoreTypeScriptChunker
@@ -58,6 +59,18 @@ public struct HybridChunker: Sendable {
     if glimmerChunker != nil { sig += "+glimmer" }
     if jsChunker.isAvailable { sig += "+jscore" }
     return sig
+  }
+
+  /// Version of the Markdown section chunking, folded into the hash of Markdown
+  /// files only (see `chunkingSignature(forLanguage:)`).
+  static let markdownSectionSignature = "+md-sections-v1"
+
+  /// The signature folded into one file's hash. Markdown carries its own
+  /// chunker version, so moving Markdown to section chunking re-chunks the
+  /// documentation and nothing else: a bump of the shared signature would
+  /// re-chunk every file of every repository on every machine.
+  public func chunkingSignature(forLanguage language: String?) -> String {
+    language == "Markdown" ? chunkingSignature + Self.markdownSectionSignature : chunkingSignature
   }
 
   /// Languages that have AST chunker support.
@@ -111,6 +124,15 @@ public struct HybridChunker: Sendable {
     fileHash: String,
     healthTracker: ChunkingHealthTracker
   ) -> ChunkingResult {
+    if language == "Markdown" {
+      return ChunkingResult(
+        chunks: markdownChunker.chunk(text: text),
+        usedAST: false,
+        failureType: nil,
+        failureMessage: nil
+      )
+    }
+
     if healthTracker.shouldSkipAST(for: filePath, hash: fileHash) {
       print("[HybridChunker] Skipping AST for \(filePath) due to previous failure")
       return ChunkingResult(
@@ -135,6 +157,9 @@ public struct HybridChunker: Sendable {
 
   /// Legacy method for backward compatibility.
   public func chunk(text: String, language: String) -> [RAGChunk] {
+    if language == "Markdown" {
+      return markdownChunker.chunk(text: text)
+    }
     if astSupportedLanguages.contains(language) {
       let chunks = chunkWithAST(text: text, language: language)
       print("[RAG] AST chunking \(language): \(chunks.count) chunks")

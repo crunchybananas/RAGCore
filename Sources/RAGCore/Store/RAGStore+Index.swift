@@ -278,7 +278,9 @@ extension RAGStore {
         : file.path
 
       let fileId = VectorMath.stableId(for: "\(repoId):\(relativePath)")
-      let fileHash = VectorMath.stableId(for: "\(chunker.chunkingSignature):\(file.text)")
+      let fileHash = VectorMath.stableId(
+        for: "\(chunker.chunkingSignature(forLanguage: file.language)):\(file.text)"
+      )
 
       // Incremental: skip unchanged files
       if !forceReindex {

@@ -70,6 +70,30 @@ public struct RAGFileScanner: Sendable {
     "vendor",
   ]
 
+  /// Hidden directories that are indexed anyway. They hold a repository's own
+  /// instructions for contributors and coding agents (`.github/instructions`,
+  /// `.github/skills`, `.claude/agents`, `.cursor/rules`, CI workflows), which
+  /// is exactly the project information a search should be able to return.
+  public static let includedHiddenDirectories: Set<String> = [".github", ".claude", ".cursor"]
+
+  /// Children of an included hidden directory that are still skipped:
+  /// `.claude/worktrees` holds whole checkouts of the repository itself.
+  static let excludedChildrenOfHiddenDirectories: [String: Set<String>] = [
+    ".claude": ["worktrees"],
+  ]
+
+  /// Whether a hidden entry (or a child of an included hidden directory that is
+  /// itself excluded) should be left out of the scan.
+  static func skipsHiddenEntry(_ url: URL, rootURL: URL) -> Bool {
+    let name = url.lastPathComponent
+    if name.hasPrefix(".") {
+      let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+      return !(isDirectory && includedHiddenDirectories.contains(name))
+    }
+    let parent = url.deletingLastPathComponent().lastPathComponent
+    return excludedChildrenOfHiddenDirectories[parent]?.contains(name) == true
+  }
+
   /// A scan's full outcome: the indexable candidates plus the root-relative
   /// paths the mandatory credential policy refused (#11). Paths only — the
   /// refused files were never read, so there are no contents to leak.
@@ -115,7 +139,7 @@ public struct RAGFileScanner: Sendable {
     guard let enumerator = FileManager.default.enumerator(
       at: rootURL,
       includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
-      options: [.skipsHiddenFiles, .skipsPackageDescendants]
+      options: [.skipsPackageDescendants]
     ) else {
       return ScanOutcome(candidates: [], policyExcludedPaths: [])
     }
@@ -126,6 +150,17 @@ public struct RAGFileScanner: Sendable {
 
     for case let fileURL as URL in enumerator {
       try cancellationCheck()
+
+      // Hidden entries stay out, as they did when the enumerator skipped them,
+      // except the directories where a repository keeps its guidance for
+      // people and agents. Decided before the credential check, so a hidden
+      // file outside those directories is still never read or reported.
+      if Self.skipsHiddenEntry(fileURL, rootURL: rootURL) {
+        if (try? fileURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+          enumerator.skipDescendants()
+        }
+        continue
+      }
 
       // The credential boundary runs FIRST, before every other filter, so no
       // later rule (and no .ragignore content) influences it. Checked on the
