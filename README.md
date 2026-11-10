@@ -16,8 +16,9 @@ A standalone Swift package for **Retrieval-Augmented Generation** (RAG) over loc
 - Swift 6.0+
 - macOS 26+ / iOS 26+
 - Dependencies:
-  - `CSQLite` (from [MCPCore](https://github.com/crunchybananas/MCPCore)) — SQLite amalgamation with FTS5, JSON1, and RTREE
   - `ASTChunker` — AST-aware source code chunking via SwiftSyntax
+
+RAGCore owns its `CSQLite` target and exports a `CSQLite` library product for consumers that access the database directly. It preserves the SQLite amalgamation, SDK-compatible headers, and build options previously supplied by MCPCore 1.6.0. RAGCore no longer depends on MCPCore. See [storage migration](MIGRATION.md) and [SQLite provenance](Sources/CSQLite/UPSTREAM.md).
 
 sqlite-vec v0.1.9 is vendored and statically linked into RAGCore. Consumers do
 not download, install, load, or separately sign a dynamic extension. RAGCore
@@ -28,9 +29,11 @@ initialization if vector support is unavailable.
 
 ### Swift Package Manager
 
+This branch prepares **3.0.0 (unreleased)**. The major version separates the new SQLite ownership from existing MCPCore 1.x dependency graphs. After release:
+
 ```swift
 dependencies: [
-  .package(url: "https://github.com/crunchybananas/RAGCore.git", from: "0.1.0"),
+  .package(url: "https://github.com/crunchybananas/RAGCore.git", from: "3.0.0"),
 ]
 ```
 
@@ -40,6 +43,7 @@ Then add `"RAGCore"` to your target's dependencies.
 
 ```
 RAGCore/
+├── CSQLite/            # Owned SQLite implementation and SDK header shim
 ├── SQLiteVec/          # Vendored sqlite-vec v0.1.9 amalgamation + C bridge
 ├── Protocols/          # EmbeddingProvider, ChunkAnalyzer, MemoryPressureMonitor
 ├── Models/             # RAGSearchResult, RAGLesson, RAGChunk, RAGDependency, etc.

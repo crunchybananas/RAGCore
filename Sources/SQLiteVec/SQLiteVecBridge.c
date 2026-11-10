@@ -1,5 +1,7 @@
 #include "SQLiteVecBridge.h"
 
+#include <stddef.h>
+
 #include "sqlite-vec.h"
 
 int32_t sqlite_vec_initialize(sqlite3 *database, char **error_message) {

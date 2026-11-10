@@ -1,0 +1,5 @@
+module CSQLite [system] [extern_c] {
+    header "CSQLiteShim.h"
+    link "sqlite3"
+    export *
+}
