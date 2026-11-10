@@ -1,4 +1,4 @@
-# RAGCore 3.0 storage ownership (unreleased)
+# RAGCore 3.0 storage ownership
 
 RAGCore now owns and exports `CSQLite`. Its `SQLiteVec` and `RAGCore` targets use
 that local target, and the package no longer depends on MCPCore. The existing
@@ -8,7 +8,7 @@ for this ownership change.
 
 ## Consumers
 
-After the coordinated releases, use RAGCore `from: "3.0.0"` and, if MCP protocol
+Use RAGCore `from: "3.0.0"` and, if MCP protocol
 types are needed, MCPCore `from: "2.0.0"`.
 
 ```swift
@@ -26,8 +26,7 @@ re-export storage.
 
 Do not combine RAGCore 3.x with MCPCore 1.x: both would provide a `CSQLite` module.
 The major version keeps existing RAGCore 2.x/MCPCore 1.x consumers on their original
-graph until they deliberately upgrade. Before tags exist, validate the paired
-branches using local paths or exact reviewed commits.
+graph until they deliberately upgrade. Use the paired release tags; local paths or exact reviewed commits are also suitable for development validation.
 
 ## Peel upgrade checklist
 
@@ -39,4 +38,4 @@ builds and its database-facing tests. Do not update only one MCPCore requirement
 or claim a Peel build based on package tests alone.
 
 The existing Peel source, lockfiles, running app, and databases are unchanged by
-this package migration. No release/tag has been published yet.
+this package migration. The storage split is tagged as RAGCore 3.0.0 and MCPCore 2.0.0.

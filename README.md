@@ -29,7 +29,7 @@ initialization if vector support is unavailable.
 
 ### Swift Package Manager
 
-This branch prepares **3.0.0 (unreleased)**. The major version separates the new SQLite ownership from existing MCPCore 1.x dependency graphs. After release:
+**RAGCore 3.0** separates SQLite ownership from existing MCPCore 1.x dependency graphs. Upgrade RAGCore and MCPCore together as described in [Migration](MIGRATION.md):
 
 ```swift
 dependencies: [
